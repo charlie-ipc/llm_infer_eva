@@ -6,7 +6,8 @@ def get_mha_params_size(config: ModelConfig, use_fp8: bool, tp_size: int):
     # TP shards heads; hidden_size is NOT sharded (row/col-parallel + allreduce)
     tp_num_heads = config.num_attention_heads // tp_size
     tp_num_kv_heads = config.num_key_value_heads // tp_size
-    wq = config.hidden_size * tp_num_heads * config.head_dim
+    q_multiplier = 2 if config.attn_output_gate else 1
+    wq = config.hidden_size * q_multiplier * tp_num_heads * config.head_dim
     wk = config.hidden_size * tp_num_kv_heads * config.head_dim
     wv = config.hidden_size * tp_num_kv_heads * config.head_dim
     wo = config.hidden_size * tp_num_heads * config.head_dim
@@ -92,10 +93,28 @@ def load_attn_weights_time(config: ModelConfig, use_fp8: bool, gpu: GPU, tp_size
     return size / 1024 / 1024 / 1024 / gpu.mem_bw
 
 
+def get_expected_active_experts(
+    config: ModelConfig, num_gpus: int, tp_size: int, num_tokens=None
+):
+    """Estimate local routed experts touched by a uniformly routed batch."""
+    ep_size = num_gpus // tp_size
+    num_local_experts = config.num_routed_experts / ep_size
+    if num_tokens is None:
+        return num_local_experts
+
+    topk = min(config.num_experts_per_tok, num_local_experts)
+    probability_not_selected = (1 - topk / num_local_experts) ** num_tokens
+    return num_local_experts * (1 - probability_not_selected)
+
+
 def load_moe_weights_time(
-    config: ModelConfig, use_fp8: bool, gpu: GPU, num_gpus, tp_size=1
+    config: ModelConfig,
+    use_fp8: bool,
+    gpu: GPU,
+    num_gpus,
+    tp_size=1,
+    num_tokens=None,
 ):
     size = get_expert_params_size(config, use_fp8, tp_size)
-    ep_size = num_gpus // tp_size
-    size *= config.num_routed_experts / ep_size
+    size *= get_expected_active_experts(config, num_gpus, tp_size, num_tokens)
     return size / 1024 / 1024 / 1024 / gpu.mem_bw
