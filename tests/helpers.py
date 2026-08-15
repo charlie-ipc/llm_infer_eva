@@ -46,6 +46,28 @@ def make_hardware(**overrides):
     return HardwareSpec.from_dict(make_hardware_dict(**overrides))
 
 
+def make_memory_bound_hardware(**overrides):
+    values = {
+        "memory_bandwidth_gbps": 1,
+        "compute_tflops": {
+            "gemm": {"w4a4": 1e9, "w4a8": 1e9},
+            "vector": {
+                "fp4": 1e9,
+                "int8": 1e9,
+                "bf16": 1e9,
+                "fp32": 1e9,
+            },
+        },
+        "kernel_launch_latency_us": {
+            "gemm": 0,
+            "vector": 0,
+            "collective": 0,
+        },
+    }
+    values.update(deepcopy(overrides))
+    return make_hardware(**values)
+
+
 def _make_precision(default_gemm_mode, default_activation_bits, **overrides):
     config = {
         "gemm_mode": default_gemm_mode,

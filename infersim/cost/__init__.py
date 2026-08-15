@@ -27,6 +27,8 @@ from infersim.cost.operations import (
     stage_operations,
 )
 from infersim.cost.stage import (
+    evaluate_decode,
+    evaluate_decode_scenarios,
     evaluate_prefill,
     evaluate_prefill_scenarios,
 )
@@ -44,6 +46,8 @@ __all__ = [
     "activation_payload_bytes",
     "all_reduce_cost",
     "all_to_all_cost",
+    "evaluate_decode",
+    "evaluate_decode_scenarios",
     "evaluate_prefill",
     "evaluate_prefill_scenarios",
     "kv_elements_per_token",

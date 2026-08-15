@@ -39,6 +39,8 @@ class StageMetrics:
     aligned_vector_ops: int
     memory: MemoryBreakdown
     component_seconds: Mapping[str, float]
+    max_supported_batch: int | None = None
+    max_supported_concurrency: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(

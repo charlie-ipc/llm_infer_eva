@@ -101,6 +101,8 @@ class PrefillEvaluatorTests(unittest.TestCase):
         self.assertIsNone(result.tpot_seconds)
         self.assertIsNone(result.output_token_capacity)
         self.assertEqual(result.memory.stage, "prefill")
+        self.assertIsNone(result.max_supported_batch)
+        self.assertIsNone(result.max_supported_concurrency)
 
     def test_kernel_totals_preserve_batched_launches_and_layer_launches(self):
         model = make_dense_model(num_hidden_layers=1)
@@ -445,6 +447,7 @@ class PrefillEvaluatorTests(unittest.TestCase):
             "average_context_length", "gemm_seconds", "vector_seconds", "tp_seconds",
             "ep_seconds", "useful_gemm_ops", "aligned_gemm_ops", "useful_vector_ops",
             "aligned_vector_ops", "memory", "component_seconds",
+            "max_supported_batch", "max_supported_concurrency",
         )
         self.assertEqual(tuple(field.name for field in fields(StageMetrics)), expected_fields)
         with self.assertRaises(FrozenInstanceError):
