@@ -26,7 +26,7 @@ def _nonnegative_integer(value: object, path: str) -> int:
     return value
 
 
-def _nonnegative_number(value: object, path: str) -> float:
+def _number(value: object, path: str) -> float:
     if isinstance(value, bool) or not isinstance(value, Real):
         raise InputValidationError(path, "must be a number")
     try:
@@ -35,6 +35,18 @@ def _nonnegative_number(value: object, path: str) -> float:
         raise InputValidationError(path, "must be finite") from None
     if not isfinite(normalized):
         raise InputValidationError(path, "must be finite")
+    return normalized
+
+
+def _positive_number(value: object, path: str) -> float:
+    normalized = _number(value, path)
+    if normalized <= 0:
+        raise InputValidationError(path, "must be positive")
+    return normalized
+
+
+def _nonnegative_number(value: object, path: str) -> float:
+    normalized = _number(value, path)
     if normalized < 0:
         raise InputValidationError(path, "must be nonnegative")
     return normalized
@@ -136,19 +148,37 @@ def _collective_cost(
             seconds=0.0,
         )
 
-    if group_size <= hardware.cards_per_node:
+    cards_per_node = _positive_integer(
+        hardware.cards_per_node, "cards_per_node"
+    )
+    if group_size <= cards_per_node:
         path = "intra_node"
         interconnect = hardware.intra_node
+        bandwidth_path = "interconnect.intra_node_gbps"
+        latency_path = "interconnect.intra_node_latency_us"
     else:
         path = "inter_node"
         interconnect = hardware.inter_node
+        bandwidth_path = "interconnect.inter_node_gbps"
+        latency_path = "interconnect.inter_node_latency_us"
+
+    bandwidth_gbps = _positive_number(
+        interconnect.bandwidth_gbps, bandwidth_path
+    )
+    latency_us = _nonnegative_number(
+        interconnect.latency_us, latency_path
+    )
+    launch_latency_us = _nonnegative_number(
+        hardware.collective_launch_latency_us,
+        "kernel_launch_latency_us.collective",
+    )
 
     transfer_ratio = transfer_factor * (group_size - 1) / group_size
     transfer_bytes = _finite_product(
         payload_bytes, transfer_ratio, "transfer_bytes"
     )
     bandwidth_bytes_per_second = _finite_product(
-        interconnect.bandwidth_gbps, 1e9, "bandwidth_seconds"
+        bandwidth_gbps, 1e9, "bandwidth_seconds"
     )
     bandwidth_seconds = _finite_divide(
         transfer_bytes,
@@ -158,13 +188,13 @@ def _collective_cost(
     latency_steps = latency_factor * (group_size - 1)
     latency_seconds = _finite_product(
         _finite_product(
-            latency_steps, interconnect.latency_us, "latency_seconds"
+            latency_steps, latency_us, "latency_seconds"
         ),
         1e-6,
         "latency_seconds",
     )
     launch_seconds = _finite_product(
-        hardware.collective_launch_latency_us,
+        launch_latency_us,
         1e-6,
         "launch_seconds",
     )
@@ -187,6 +217,12 @@ def _collective_cost(
 def all_reduce_cost(
     payload_bytes: float, group_size: int, hardware: HardwareSpec
 ) -> CollectiveCost:
+    """Estimate ring all-reduce for one rank's local payload.
+
+    Ranks are assumed compactly placed: a group that fits within
+    ``cards_per_node`` uses the intra-node link; larger groups use the
+    inter-node link.
+    """
     return _collective_cost(
         "all_reduce",
         payload_bytes,
@@ -200,6 +236,12 @@ def all_reduce_cost(
 def all_to_all_cost(
     payload_bytes: float, group_size: int, hardware: HardwareSpec
 ) -> CollectiveCost:
+    """Estimate ring all-to-all for one rank's local payload.
+
+    Ranks are assumed compactly placed: a group that fits within
+    ``cards_per_node`` uses the intra-node link; larger groups use the
+    inter-node link.
+    """
     return _collective_cost(
         "all_to_all",
         payload_bytes,

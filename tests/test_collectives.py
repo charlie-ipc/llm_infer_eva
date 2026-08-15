@@ -87,8 +87,128 @@ class CollectiveCostTests(unittest.TestCase):
         self.assertEqual(all_reduce_cost(1, 4, hardware).path, "intra_node")
         self.assertEqual(all_reduce_cost(1, 5, hardware).path, "inter_node")
 
-    def test_single_member_collectives_are_strictly_zero(self):
+    def test_validates_cards_per_node_before_selecting_a_link(self):
         hardware = make_hardware()
+
+        for value in (0, -1, True, "8", math.nan, math.inf):
+            with self.subTest(value=value):
+                self.assert_invalid_path(
+                    "cards_per_node",
+                    all_reduce_cost,
+                    1,
+                    2,
+                    replace(hardware, cards_per_node=value),
+                )
+
+    def test_validates_only_the_selected_intra_node_link(self):
+        hardware = make_hardware()
+        paths_and_values = (
+            (
+                "interconnect.intra_node_gbps",
+                "bandwidth_gbps",
+                (0, -1, True, math.nan, math.inf),
+            ),
+            (
+                "interconnect.intra_node_latency_us",
+                "latency_us",
+                (-1, True, math.nan, math.inf),
+            ),
+        )
+
+        for path, field, values in paths_and_values:
+            for value in values:
+                with self.subTest(path=path, value=value):
+                    invalid = replace(
+                        hardware,
+                        intra_node=replace(
+                            hardware.intra_node, **{field: value}
+                        ),
+                    )
+                    self.assert_invalid_path(
+                        path, all_reduce_cost, 1, 2, invalid
+                    )
+
+        unselected_invalid = replace(
+            hardware,
+            inter_node=replace(
+                hardware.inter_node,
+                bandwidth_gbps=-1,
+                latency_us=-1,
+            ),
+        )
+        self.assertEqual(
+            all_reduce_cost(1, 2, unselected_invalid).path, "intra_node"
+        )
+
+    def test_validates_only_the_selected_inter_node_link(self):
+        hardware = make_hardware(cards_per_node=1)
+        paths_and_values = (
+            (
+                "interconnect.inter_node_gbps",
+                "bandwidth_gbps",
+                (0, -1, True, math.nan, math.inf),
+            ),
+            (
+                "interconnect.inter_node_latency_us",
+                "latency_us",
+                (-1, True, math.nan, math.inf),
+            ),
+        )
+
+        for path, field, values in paths_and_values:
+            for value in values:
+                with self.subTest(path=path, value=value):
+                    invalid = replace(
+                        hardware,
+                        inter_node=replace(
+                            hardware.inter_node, **{field: value}
+                        ),
+                    )
+                    self.assert_invalid_path(
+                        path, all_to_all_cost, 1, 2, invalid
+                    )
+
+        unselected_invalid = replace(
+            hardware,
+            intra_node=replace(
+                hardware.intra_node,
+                bandwidth_gbps=-1,
+                latency_us=-1,
+            ),
+        )
+        self.assertEqual(
+            all_to_all_cost(1, 2, unselected_invalid).path, "inter_node"
+        )
+
+    def test_validates_collective_launch_latency(self):
+        hardware = make_hardware()
+
+        for value in (-1, True, math.nan, math.inf):
+            with self.subTest(value=value):
+                self.assert_invalid_path(
+                    "kernel_launch_latency_us.collective",
+                    all_reduce_cost,
+                    1,
+                    2,
+                    replace(hardware, collective_launch_latency_us=value),
+                )
+
+        zero_launch = replace(hardware, collective_launch_latency_us=0)
+        self.assertEqual(all_reduce_cost(1, 2, zero_launch).launch_seconds, 0.0)
+
+    def test_single_member_collectives_are_strictly_zero(self):
+        valid = make_hardware()
+        hardware = replace(
+            valid,
+            cards_per_node="invalid",
+            collective_launch_latency_us=-1,
+            intra_node=replace(
+                valid.intra_node, bandwidth_gbps=-1, latency_us=-1
+            ),
+            inter_node=replace(
+                valid.inter_node, bandwidth_gbps=-1, latency_us=-1
+            ),
+        )
 
         for function, kind in (
             (all_reduce_cost, "all_reduce"),
@@ -209,7 +329,11 @@ class CollectiveCostTests(unittest.TestCase):
             hardware, collective_launch_latency_us=math.inf
         )
         self.assert_invalid_path(
-            "launch_seconds", all_to_all_cost, 1, 2, nonfinite_launch
+            "kernel_launch_latency_us.collective",
+            all_to_all_cost,
+            1,
+            2,
+            nonfinite_launch,
         )
 
     def test_result_is_frozen_and_all_byte_and_time_fields_are_floats(self):
