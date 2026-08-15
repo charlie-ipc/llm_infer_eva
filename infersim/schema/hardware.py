@@ -24,7 +24,10 @@ def _mapping(value: Any, path: str) -> Mapping[str, Any]:
 def _number(value: Any, path: str) -> float:
     if isinstance(value, bool) or not isinstance(value, Real):
         raise InputValidationError(path, "must be a number")
-    normalized = float(value)
+    try:
+        normalized = float(value)
+    except (OverflowError, ValueError):
+        raise InputValidationError(path, "must be finite") from None
     if not isfinite(normalized):
         raise InputValidationError(path, "must be finite")
     return normalized

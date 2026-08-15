@@ -26,7 +26,9 @@ def _powers_of_two(maximum: int) -> tuple[int, ...]:
 
 
 def _axis(value: Any, path: str, max_cards: int | None) -> tuple[int, ...]:
-    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+    if isinstance(value, (str, bytes, bytearray)) or not isinstance(
+        value, Sequence
+    ):
         raise InputValidationError(path, "must be a sequence")
     if not value:
         raise InputValidationError(path, "must not be empty")

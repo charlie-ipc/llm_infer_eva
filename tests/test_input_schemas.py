@@ -110,6 +110,13 @@ class HardwareSpecTests(PathAssertions, unittest.TestCase):
             hardware_config(memory_bandwidth_gbps=0),
         )
 
+    def test_normalizes_integer_overflow_to_validation_error(self):
+        self.assert_invalid_path(
+            "memory_capacity_gb",
+            HardwareSpec.from_dict,
+            hardware_config(memory_capacity_gb=10**1000),
+        )
+
     def test_rejects_invalid_nested_hardware_values_with_exact_paths(self):
         cases = [
             ({"compute_tflops": {"gemm": {}, "vector": {"int8": 1}}},
@@ -292,6 +299,20 @@ class ScenarioTests(PathAssertions, unittest.TestCase):
                     scenario_config(**{field: value}),
                 )
 
+    def test_normalizes_workload_integer_overflow_to_validation_error(self):
+        self.assert_invalid_path(
+            "request_rate",
+            WorkloadScenario.from_dict,
+            scenario_config(request_rate=10**1000),
+        )
+
+    def test_rejects_bytearray_scenario_sequence_at_container_path(self):
+        self.assert_invalid_path(
+            "scenarios",
+            ScenarioSet.from_dict,
+            {"policy": "all", "scenarios": bytearray([1])},
+        )
+
 
 class PDLinkSpecTests(PathAssertions, unittest.TestCase):
     def test_accepts_efficiency_boundaries(self):
@@ -326,6 +347,18 @@ class PDLinkSpecTests(PathAssertions, unittest.TestCase):
                 config = dict(base)
                 config[field] = value
                 self.assert_invalid_path(field, PDLinkSpec.from_dict, config)
+
+    def test_normalizes_link_integer_overflow_to_validation_error(self):
+        self.assert_invalid_path(
+            "bandwidth_gbps",
+            PDLinkSpec.from_dict,
+            {
+                "bandwidth_gbps": 10**1000,
+                "latency_us": 5,
+                "efficiency": 0.8,
+                "max_concurrent_transfers": 4,
+            },
+        )
 
 
 class SearchSpaceTests(PathAssertions, unittest.TestCase):
@@ -368,6 +401,14 @@ class SearchSpaceTests(PathAssertions, unittest.TestCase):
                 self.assert_invalid_path(
                     path, SearchSpace.from_dict, config, 8
                 )
+
+    def test_rejects_bytearray_axis_at_container_path(self):
+        self.assert_invalid_path(
+            "replicas",
+            SearchSpace.from_dict,
+            {"replicas": bytearray([1, 2])},
+            8,
+        )
 
     def test_rejects_invalid_max_cards(self):
         for value in (0, -1, True, 1.5):

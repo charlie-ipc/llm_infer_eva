@@ -17,7 +17,10 @@ def _required(data: Mapping[str, Any], field: str, prefix: str = "") -> Any:
 def _number(value: Any, path: str) -> float:
     if isinstance(value, bool) or not isinstance(value, Real):
         raise InputValidationError(path, "must be a number")
-    normalized = float(value)
+    try:
+        normalized = float(value)
+    except (OverflowError, ValueError):
+        raise InputValidationError(path, "must be finite") from None
     if not isfinite(normalized):
         raise InputValidationError(path, "must be finite")
     return normalized
@@ -117,7 +120,7 @@ class ScenarioSet:
             raise InputValidationError("policy", "must be 'all' or 'weighted'")
         raw_scenarios = _required(data, "scenarios")
         if (
-            isinstance(raw_scenarios, (str, bytes))
+            isinstance(raw_scenarios, (str, bytes, bytearray))
             or not isinstance(raw_scenarios, Sequence)
         ):
             raise InputValidationError("scenarios", "must be a sequence")
