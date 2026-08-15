@@ -1,3 +1,9 @@
+from infersim.cost.collective import (
+    CollectiveCost,
+    activation_payload_bytes,
+    all_reduce_cost,
+    all_to_all_cost,
+)
 from infersim.cost.kernels import (
     gemm_cost,
     kernel_cost,
@@ -23,12 +29,16 @@ from infersim.cost.operations import (
 from infersim.cost.types import KernelCost
 
 __all__ = [
+    "CollectiveCost",
     "GemmShape",
     "KernelCost",
     "MemoryBreakdown",
     "ModelCounts",
     "StageOperations",
     "VectorShape",
+    "activation_payload_bytes",
+    "all_reduce_cost",
+    "all_to_all_cost",
     "kv_elements_per_token",
     "kv_bytes_per_request",
     "gemm_cost",
