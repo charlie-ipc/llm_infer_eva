@@ -57,31 +57,56 @@ def _ceil_div(value: int, divisor: int) -> int:
     return (value + divisor - 1) // divisor
 
 
+def _finite_divide(
+    numerator: int | float, denominator: int | float, path: str
+) -> float:
+    try:
+        value = numerator / denominator
+    except OverflowError:
+        raise InputValidationError(path, "derived value must be finite") from None
+    if not isfinite(value):
+        raise InputValidationError(path, "derived value must be finite")
+    return value
+
+
+def _finite_add(left: float, right: float, path: str) -> float:
+    value = left + right
+    if not isfinite(value):
+        raise InputValidationError(path, "derived value must be finite")
+    return value
+
+
 def kernel_cost(
     *,
     useful_ops: int,
     aligned_ops: int,
-    compute_tops: float,
+    compute_ops_per_second: float,
     memory_bytes: float,
     memory_bandwidth_bytes_s: float,
     launch_seconds: float,
 ) -> KernelCost:
     """Combine compute, memory, and launch costs with a roofline model.
 
-    Despite its historical name, ``compute_tops`` is an ops/second value.
-    Kernel-specific wrappers convert advertised TFLOPS to ops/second.
+    ``compute_ops_per_second`` is measured in ops/s. Kernel-specific wrappers
+    convert advertised TFLOPS to ops/s before calling this function.
     """
     useful_ops = _nonnegative_integer(useful_ops, "useful_ops")
     aligned_ops = _nonnegative_integer(aligned_ops, "aligned_ops")
-    compute_ops_s = _positive_number(compute_tops, "compute_tops")
+    compute_ops_per_second = _positive_number(
+        compute_ops_per_second, "compute_ops_per_second"
+    )
     memory_bytes = _nonnegative_number(memory_bytes, "memory_bytes")
     memory_bandwidth_bytes_s = _positive_number(
         memory_bandwidth_bytes_s, "memory_bandwidth_bytes_s"
     )
     launch_seconds = _nonnegative_number(launch_seconds, "launch_seconds")
 
-    compute_seconds = aligned_ops / compute_ops_s
-    memory_seconds = memory_bytes / memory_bandwidth_bytes_s
+    compute_seconds = _finite_divide(
+        aligned_ops, compute_ops_per_second, "aligned_ops"
+    )
+    memory_seconds = _finite_divide(
+        memory_bytes, memory_bandwidth_bytes_s, "memory_bytes"
+    )
     bottleneck = (
         "compute" if compute_seconds >= memory_seconds else "memory"
     )
@@ -92,7 +117,9 @@ def kernel_cost(
         memory_bytes=memory_bytes,
         memory_seconds=memory_seconds,
         launch_seconds=launch_seconds,
-        seconds=max(compute_seconds, memory_seconds) + launch_seconds,
+        seconds=_finite_add(
+            max(compute_seconds, memory_seconds), launch_seconds, "seconds"
+        ),
         bottleneck=bottleneck,
     )
 
@@ -135,16 +162,17 @@ def gemm_cost(
     )
     work_per_tile = 2 * tile_m * tile_n * tile_k
 
-    bytes_per_repeat = (
-        m * k * precision.activation_bits / 8
-        + k * n * precision.weight_bits / 8
-        + m * n * precision.activation_bits / 8
+    memory_bits = repeats * (
+        m * k * precision.activation_bits
+        + k * n * precision.weight_bits
+        + m * n * precision.activation_bits
     )
+    memory_bytes = _finite_divide(memory_bits, 8, "memory_bytes")
     return kernel_cost(
         useful_ops=2 * m * k * n * repeats,
         aligned_ops=aligned_tiles * work_per_tile,
-        compute_tops=hardware.gemm_tflops[mode] * 1e12,
-        memory_bytes=bytes_per_repeat * repeats,
+        compute_ops_per_second=hardware.gemm_tflops[mode] * 1e12,
+        memory_bytes=memory_bytes,
         memory_bandwidth_bytes_s=hardware.memory_bandwidth_gbps * 1e9,
         launch_seconds=hardware.gemm_launch_latency_us * 1e-6,
     )
@@ -189,8 +217,10 @@ def vector_cost(
                 "vector_mode",
                 "memory bytes require a canonical precision mode",
             )
-        memory_bytes = (
-            elements * repeats * 2 * _VECTOR_BITS[vector_mode] / 8
+        memory_bytes = _finite_divide(
+            elements * repeats * 2 * _VECTOR_BITS[vector_mode],
+            8,
+            "memory_bytes",
         )
     else:
         memory_bytes = _nonnegative_number(memory_bytes, "memory_bytes")
@@ -206,7 +236,7 @@ def vector_cost(
         aligned_ops=(
             aligned_elements_per_repeat * ops_per_element * repeats
         ),
-        compute_tops=hardware.vector_tflops[vector_mode] * 1e12,
+        compute_ops_per_second=hardware.vector_tflops[vector_mode] * 1e12,
         memory_bytes=memory_bytes,
         memory_bandwidth_bytes_s=hardware.memory_bandwidth_gbps * 1e9,
         launch_seconds=hardware.vector_launch_latency_us * 1e-6,

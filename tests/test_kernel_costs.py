@@ -1,6 +1,7 @@
 import math
 import unittest
 from dataclasses import FrozenInstanceError
+from inspect import signature
 
 from infersim.cost import (
     KernelCost,
@@ -30,7 +31,7 @@ class KernelCostTests(PathAssertions, unittest.TestCase):
         cost = kernel_cost(
             useful_ops=1,
             aligned_ops=1,
-            compute_tops=1e9,
+            compute_ops_per_second=1e9,
             memory_bytes=1000,
             memory_bandwidth_bytes_s=100,
             launch_seconds=0,
@@ -49,7 +50,7 @@ class KernelCostTests(PathAssertions, unittest.TestCase):
         cost = kernel_cost(
             useful_ops=0,
             aligned_ops=10,
-            compute_tops=10,
+            compute_ops_per_second=10,
             memory_bytes=100,
             memory_bandwidth_bytes_s=100,
             launch_seconds=0.25,
@@ -64,11 +65,17 @@ class KernelCostTests(PathAssertions, unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             cost.seconds = 3
 
+    def test_names_common_throughput_in_ops_per_second(self):
+        parameters = signature(kernel_cost).parameters
+
+        self.assertIn("compute_ops_per_second", parameters)
+        self.assertNotIn("compute_tops", parameters)
+
     def test_rejects_invalid_common_inputs(self):
         base = {
             "useful_ops": 1,
             "aligned_ops": 1,
-            "compute_tops": 1,
+            "compute_ops_per_second": 1,
             "memory_bytes": 1,
             "memory_bandwidth_bytes_s": 1,
             "launch_seconds": 0,
@@ -78,9 +85,9 @@ class KernelCostTests(PathAssertions, unittest.TestCase):
             ("useful_ops", True),
             ("aligned_ops", -1),
             ("aligned_ops", False),
-            ("compute_tops", 0),
-            ("compute_tops", math.nan),
-            ("compute_tops", math.inf),
+            ("compute_ops_per_second", 0),
+            ("compute_ops_per_second", math.nan),
+            ("compute_ops_per_second", math.inf),
             ("memory_bytes", -1),
             ("memory_bytes", True),
             ("memory_bytes", math.nan),
@@ -94,6 +101,29 @@ class KernelCostTests(PathAssertions, unittest.TestCase):
                 inputs = dict(base)
                 inputs[field] = value
                 self.assert_invalid_path(field, kernel_cost, **inputs)
+
+    def test_normalizes_derived_float_overflow_to_validation_errors(self):
+        base = {
+            "useful_ops": 1,
+            "aligned_ops": 1,
+            "compute_ops_per_second": 1,
+            "memory_bytes": 0,
+            "memory_bandwidth_bytes_s": 1,
+            "launch_seconds": 0,
+        }
+        cases = [
+            ("aligned_ops", {"aligned_ops": 10**1000}),
+            ("memory_bytes", {"memory_bytes": 10**1000}),
+            (
+                "seconds",
+                {"aligned_ops": 10**308, "launch_seconds": 1e308},
+            ),
+        ]
+        for path, overrides in cases:
+            with self.subTest(path=path):
+                inputs = dict(base)
+                inputs.update(overrides)
+                self.assert_invalid_path(path, kernel_cost, **inputs)
 
 
 class GemmCostTests(PathAssertions, unittest.TestCase):
@@ -213,6 +243,42 @@ class GemmCostTests(PathAssertions, unittest.TestCase):
             repeats=False,
         )
 
+    def test_normalizes_huge_dimensions_and_repeats_to_memory_path(self):
+        hardware = make_hardware()
+        precision = make_w4a8_precision()
+        cases = [
+            ((10**1000, 1, 1), 1),
+            ((1, 1, 1), 10**1000),
+        ]
+        for dimensions, repeats in cases:
+            with self.subTest(dimensions=dimensions, repeats=repeats):
+                self.assert_invalid_path(
+                    "memory_bytes",
+                    gemm_cost,
+                    *dimensions,
+                    hardware,
+                    precision,
+                    repeats=repeats,
+                )
+
+    def test_rejects_nonfinite_scaled_gemm_throughput(self):
+        hardware = make_hardware(
+            compute_tflops={
+                "gemm": {"w4a8": 1e300},
+                "vector": {"int8": 1},
+            }
+        )
+
+        self.assert_invalid_path(
+            "compute_ops_per_second",
+            gemm_cost,
+            1,
+            1,
+            1,
+            hardware,
+            make_w4a8_precision(),
+        )
+
 
 class VectorCostTests(PathAssertions, unittest.TestCase):
     def test_aligns_each_repeat_to_full_vector_wave(self):
@@ -299,6 +365,35 @@ class VectorCostTests(PathAssertions, unittest.TestCase):
                 self.assert_invalid_path(
                     field, vector_cost, *args, hardware, **kwargs
                 )
+
+    def test_normalizes_huge_structure_values_to_derived_paths(self):
+        hardware = make_hardware()
+        cases = [
+            ("memory_bytes", (10**1000, 1), {"repeats": 1}),
+            (
+                "aligned_ops",
+                (1, 10**1000),
+                {"repeats": 1, "memory_bytes": 0},
+            ),
+            ("memory_bytes", (1, 1), {"repeats": 10**1000}),
+        ]
+        for path, args, kwargs in cases:
+            with self.subTest(path=path, args=args):
+                self.assert_invalid_path(
+                    path, vector_cost, *args, "int8", hardware, **kwargs
+                )
+
+    def test_rejects_nonfinite_scaled_vector_bandwidth(self):
+        hardware = make_hardware(memory_bandwidth_gbps=1e300)
+
+        self.assert_invalid_path(
+            "memory_bandwidth_bytes_s",
+            vector_cost,
+            1,
+            1,
+            "int8",
+            hardware,
+        )
 
 
 class HelperTests(unittest.TestCase):
