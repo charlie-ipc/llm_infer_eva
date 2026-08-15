@@ -14,11 +14,24 @@ from infersim.schema.precision import PrecisionSpec
 from infersim.search import validate_plan
 
 
+_BIT_WIDTHS = frozenset({4, 8, 16, 32})
+
+
 def _positive_integer(value: object, path: str) -> int:
     if type(value) is not int:
         raise InputValidationError(path, "must be an integer")
     if value <= 0:
         raise InputValidationError(path, "must be positive")
+    return value
+
+
+def _precision_bit_width(precision: PrecisionSpec, field: str) -> int:
+    value = getattr(precision, field)
+    if type(value) is not int or value not in _BIT_WIDTHS:
+        raise InputValidationError(
+            field,
+            "must be one of 4, 8, 16, or 32",
+        )
     return value
 
 
@@ -94,10 +107,11 @@ def kv_bytes_per_request(
     if not isinstance(precision, PrecisionSpec):
         raise InputValidationError("precision", "must be a PrecisionSpec")
     context_length = _positive_integer(context_length, "context_length")
+    kv_cache_bits = _precision_bit_width(precision, "kv_cache_bits")
     return _finite_divide(
         kv_elements_per_token(model)
         * context_length
-        * precision.kv_cache_bits,
+        * kv_cache_bits,
         8,
         "kv_bytes_per_request",
     )
@@ -128,7 +142,9 @@ def memory_breakdown(
         raise InputValidationError("hardware", "must be a HardwareSpec")
     if not isinstance(precision, PrecisionSpec):
         raise InputValidationError("precision", "must be a PrecisionSpec")
-    precision.validate_hardware(hardware)
+    weight_bits = _precision_bit_width(precision, "weight_bits")
+    activation_bits = _precision_bit_width(precision, "activation_bits")
+    _precision_bit_width(precision, "kv_cache_bits")
     if not isinstance(plan, ParallelPlan):
         raise InputValidationError("plan", "must be a ParallelPlan")
     plan_validation = validate_plan(model, plan)
@@ -146,32 +162,32 @@ def memory_breakdown(
     counts = model_counts(model)
     weight_denominator = 8
     embedding_weight_bytes = _finite_divide(
-        counts.embedding_weight_elements * precision.weight_bits,
+        counts.embedding_weight_elements * weight_bits,
         weight_denominator,
         "embedding_weight_bytes",
     )
     attention_weight_bytes = _finite_divide(
-        counts.attention_weight_elements * precision.weight_bits,
+        counts.attention_weight_elements * weight_bits,
         weight_denominator * plan.attention_tp,
         "attention_weight_bytes",
     )
     linear_attention_weight_bytes = _finite_divide(
-        counts.linear_attention_weight_elements * precision.weight_bits,
+        counts.linear_attention_weight_elements * weight_bits,
         weight_denominator * plan.attention_tp,
         "linear_attention_weight_bytes",
     )
     dense_ffn_weight_bytes = _finite_divide(
-        counts.dense_ffn_weight_elements * precision.weight_bits,
+        counts.dense_ffn_weight_elements * weight_bits,
         weight_denominator * plan.attention_tp,
         "dense_ffn_weight_bytes",
     )
     routed_expert_weight_bytes = _finite_divide(
-        counts.routed_expert_weight_elements * precision.weight_bits,
+        counts.routed_expert_weight_elements * weight_bits,
         weight_denominator * plan.moe_tp * plan.expert_parallel,
         "routed_expert_weight_bytes",
     )
     shared_expert_weight_bytes = _finite_divide(
-        counts.shared_expert_weight_elements * precision.weight_bits,
+        counts.shared_expert_weight_elements * weight_bits,
         weight_denominator * plan.moe_tp,
         "shared_expert_weight_bytes",
     )
@@ -195,25 +211,33 @@ def memory_breakdown(
         precision,
         context_length,
     )
-    kv_shards = plan.attention_dp
-    if model.attention_kind != "mla":
-        kv_shards *= plan.attention_tp
+    local_requests = (
+        batch_size + plan.attention_dp - 1
+    ) // plan.attention_dp
+    kv_shards = 1 if model.attention_kind == "mla" else plan.attention_tp
     kv_bytes_per_card = _finite_divide(
-        _finite_product(request_kv_bytes, batch_size, "kv_bytes_per_card"),
+        _finite_product(
+            request_kv_bytes,
+            local_requests,
+            "kv_bytes_per_card",
+        ),
         kv_shards,
         "kv_bytes_per_card",
     )
 
     recurrent_state_bytes_per_card = _finite_divide(
-        recurrent_state_bytes_per_request(model) * batch_size,
-        plan.attention_dp,
+        recurrent_state_bytes_per_request(model) * local_requests,
+        1,
         "recurrent_state_bytes_per_card",
     )
 
-    stage_tokens = batch_size * input_length if stage == "prefill" else batch_size
-    local_tokens = (stage_tokens + plan.attention_dp - 1) // plan.attention_dp
+    local_tokens = (
+        local_requests * input_length
+        if stage == "prefill"
+        else local_requests
+    )
     activation_bytes_per_card = _finite_divide(
-        2 * local_tokens * model.hidden_size * precision.activation_bits,
+        2 * local_tokens * model.hidden_size * activation_bits,
         8,
         "activation_bytes_per_card",
     )

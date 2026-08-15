@@ -1,6 +1,5 @@
-import math
 import unittest
-from dataclasses import FrozenInstanceError, fields
+from dataclasses import FrozenInstanceError, fields, replace
 
 from infersim.cost import (
     MemoryBreakdown,
@@ -195,7 +194,7 @@ class MemoryCostTests(unittest.TestCase):
         full = recurrent_state_bytes_per_request(model)
         self.assertEqual(result.recurrent_state_bytes_per_card, full * 8 / 2)
 
-    def test_activation_ceil_does_not_round_fractional_cache_placement(self):
+    def test_worst_dp_rank_uses_the_same_local_request_count(self):
         model = make_hybrid_model(
             num_attention_heads=4,
             num_key_value_heads=4,
@@ -219,8 +218,26 @@ class MemoryCostTests(unittest.TestCase):
             input_length=3,
         )
 
-        self.assertEqual(result.activation_bytes_per_card, 2 * math.ceil(15 / 2) * model.hidden_size)
-        self.assertEqual(result.kv_bytes_per_card, kv_bytes_per_request(model, precision, 3) * 5 / 2 / 2)
+        local_requests = 3
+        self.assertEqual(
+            result.kv_bytes_per_card,
+            kv_bytes_per_request(model, precision, 3)
+            * local_requests
+            / plan.attention_tp,
+        )
+        self.assertEqual(
+            result.recurrent_state_bytes_per_card,
+            recurrent_state_bytes_per_request(model) * local_requests,
+        )
+        self.assertEqual(
+            result.activation_bytes_per_card,
+            2
+            * local_requests
+            * 3
+            * model.hidden_size
+            * precision.activation_bits
+            / 8,
+        )
 
     def test_capacity_accounting_reports_feasible_and_infeasible_results(self):
         hardware = make_hardware(
@@ -271,7 +288,20 @@ class MemoryCostTests(unittest.TestCase):
                     kv_bytes_per_request(model, precision, value)
                 self.assertEqual(caught.exception.path, "context_length")
 
-    def test_validates_hardware_plan_stage_and_dimensions_with_full_paths(self):
+    def test_memory_breakdown_does_not_require_compute_precision_modes(self):
+        result = breakdown(
+            make_dense_model(),
+            hardware=make_hardware(
+                compute_tflops={
+                    "gemm": {"w4a4": 1},
+                    "vector": {"fp4": 1},
+                }
+            ),
+        )
+
+        self.assertIsInstance(result, MemoryBreakdown)
+
+    def test_validates_precision_bits_plan_stage_and_dimensions_with_full_paths(self):
         model = make_dense_model()
         invalid_plan = make_dense_plan(attention_tp=3, moe_tp=3)
         base = {
@@ -281,17 +311,12 @@ class MemoryCostTests(unittest.TestCase):
             "output_length": 1,
         }
 
-        with self.assertRaises(InputValidationError) as caught:
-            breakdown(
-                model,
-                hardware=make_hardware(
-                    compute_tflops={
-                        "gemm": {"w4a4": 1},
-                        "vector": {"int8": 1},
-                    }
-                ),
-            )
-        self.assertEqual(caught.exception.path, "compute_tflops.gemm.w4a8")
+        for field in ("weight_bits", "activation_bits", "kv_cache_bits"):
+            with self.subTest(field=field):
+                precision = replace(make_w4a8_precision(), **{field: 3})
+                with self.assertRaises(InputValidationError) as caught:
+                    breakdown(model, precision=precision)
+                self.assertEqual(caught.exception.path, field)
 
         with self.assertRaises(InputValidationError) as caught:
             memory_breakdown(
