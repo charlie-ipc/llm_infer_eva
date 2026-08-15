@@ -4,6 +4,7 @@ from infersim.schema.hardware import HardwareSpec
 from infersim.schema.model import ModelSpec
 from infersim.schema.parallel import ParallelPlan
 from infersim.schema.precision import PrecisionSpec
+from infersim.schema.scenario import ScenarioSet, WorkloadScenario
 
 
 def make_hardware_dict(**overrides):
@@ -156,3 +157,27 @@ def make_moe_plan(**overrides):
     }
     values.update(deepcopy(overrides))
     return ParallelPlan(**values)
+
+
+def make_scenario(**overrides):
+    values = {
+        "name": "interactive",
+        "input_length": 128,
+        "output_length": 32,
+        "request_rate": 1,
+        "concurrency": 4,
+        "ttft_limit_ms": 100,
+        "tpot_limit_ms": 20,
+        "weight": 1,
+    }
+    values.update(deepcopy(overrides))
+    return WorkloadScenario(**values)
+
+
+def make_scenario_set(scenarios=None, **overrides):
+    values = {
+        "policy": "all",
+        "scenarios": tuple(scenarios) if scenarios is not None else (make_scenario(),),
+    }
+    values.update(deepcopy(overrides))
+    return ScenarioSet(**values)

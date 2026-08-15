@@ -26,7 +26,11 @@ from infersim.cost.operations import (
     recurrent_state_bytes_per_request,
     stage_operations,
 )
-from infersim.cost.types import KernelCost
+from infersim.cost.stage import (
+    evaluate_prefill,
+    evaluate_prefill_scenarios,
+)
+from infersim.cost.types import KernelCost, StageMetrics
 
 __all__ = [
     "CollectiveCost",
@@ -35,10 +39,13 @@ __all__ = [
     "MemoryBreakdown",
     "ModelCounts",
     "StageOperations",
+    "StageMetrics",
     "VectorShape",
     "activation_payload_bytes",
     "all_reduce_cost",
     "all_to_all_cost",
+    "evaluate_prefill",
+    "evaluate_prefill_scenarios",
     "kv_elements_per_token",
     "kv_bytes_per_request",
     "gemm_cost",
