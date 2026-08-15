@@ -1,6 +1,6 @@
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from infersim.errors import InputValidationError, UnsupportedModelError
 
@@ -61,21 +61,151 @@ def _optional_positive(
 
 
 def _aliased_value(
-    config: Mapping[str, Any], fields: tuple[str, ...], default: Any
-) -> tuple[str, Any]:
+    config: Mapping[str, Any],
+    fields: tuple[str, ...],
+    default: Any,
+    prefix: str,
+    validator: Callable[[Any, str], Any],
+) -> tuple[str, Any, bool]:
+    selected_field = fields[0]
+    selected_value = default
+    present = False
     for field in fields:
         if field in config:
-            return field, config[field]
-    return fields[0], default
+            value = validator(config[field], _field_path(prefix, field))
+            if present and value != selected_value:
+                raise InputValidationError(
+                    _field_path(prefix, field),
+                    f"conflicts with {selected_field}",
+                )
+            if not present:
+                selected_field = field
+                selected_value = value
+                present = True
+    return selected_field, selected_value, present
+
+
+def _boolean_value(value: Any, path: str) -> bool:
+    if type(value) is not bool:
+        raise InputValidationError(path, "must be a boolean")
+    return value
 
 
 def _boolean(
     config: Mapping[str, Any], fields: tuple[str, ...], prefix: str
 ) -> bool:
-    field, value = _aliased_value(config, fields, False)
-    if type(value) is not bool:
-        raise InputValidationError(_field_path(prefix, field), "must be a boolean")
+    _, value, _ = _aliased_value(
+        config, fields, False, prefix, _boolean_value
+    )
     return value
+
+
+def _attention_layer_counts(
+    config: Mapping[str, Any], prefix: str, num_hidden_layers: int
+) -> tuple[int, int]:
+    full_present = "num_full_attention_layers" in config
+    linear_present = "num_linear_attention_layers" in config
+    explicit_counts = None
+    if full_present or linear_present:
+        if full_present:
+            full_count = _nonnegative_integer(
+                config["num_full_attention_layers"],
+                _field_path(prefix, "num_full_attention_layers"),
+            )
+        else:
+            linear_count = _nonnegative_integer(
+                config["num_linear_attention_layers"],
+                _field_path(prefix, "num_linear_attention_layers"),
+            )
+            full_count = num_hidden_layers - linear_count
+
+        if linear_present:
+            linear_count = _nonnegative_integer(
+                config["num_linear_attention_layers"],
+                _field_path(prefix, "num_linear_attention_layers"),
+            )
+        else:
+            linear_count = num_hidden_layers - full_count
+
+        if (
+            full_count < 0
+            or linear_count < 0
+            or full_count + linear_count != num_hidden_layers
+        ):
+            raise InputValidationError(
+                _field_path(prefix, "num_hidden_layers"),
+                "must equal full plus linear attention layer counts",
+            )
+        explicit_counts = (full_count, linear_count)
+
+    layer_type_counts = None
+    if "layer_types" in config:
+        layer_types = config["layer_types"]
+        if not isinstance(layer_types, Sequence) or isinstance(
+            layer_types, (str, bytes, bytearray)
+        ):
+            raise InputValidationError(
+                _field_path(prefix, "layer_types"), "must be a sequence"
+            )
+        if len(layer_types) != num_hidden_layers:
+            raise InputValidationError(
+                _field_path(prefix, "layer_types"),
+                "length must equal num_hidden_layers",
+            )
+        full_count = 0
+        for index, layer_type in enumerate(layer_types):
+            if layer_type not in ("full_attention", "linear_attention"):
+                raise InputValidationError(
+                    _field_path(prefix, f"layer_types[{index}]"),
+                    "must be full_attention or linear_attention",
+                )
+            full_count += layer_type == "full_attention"
+        layer_type_counts = (full_count, num_hidden_layers - full_count)
+
+    interval_counts = None
+    if "full_attention_interval" in config:
+        interval = _positive_integer(
+            config["full_attention_interval"],
+            _field_path(prefix, "full_attention_interval"),
+        )
+        full_count = num_hidden_layers // interval
+        interval_counts = (full_count, num_hidden_layers - full_count)
+
+    if (
+        layer_type_counts is not None
+        and interval_counts is not None
+        and layer_type_counts != interval_counts
+    ):
+        raise InputValidationError(
+            _field_path(prefix, "full_attention_interval"),
+            "conflicts with layer_types-derived counts",
+        )
+
+    derived_sources = (
+        ("layer_types", layer_type_counts),
+        ("full_attention_interval", interval_counts),
+    )
+    if explicit_counts is not None:
+        for source, derived_counts in derived_sources:
+            if derived_counts is None:
+                continue
+            if explicit_counts[0] != derived_counts[0]:
+                raise InputValidationError(
+                    _field_path(prefix, "num_full_attention_layers"),
+                    f"conflicts with {source}",
+                )
+            if explicit_counts[1] != derived_counts[1]:
+                raise InputValidationError(
+                    _field_path(prefix, "num_linear_attention_layers"),
+                    f"conflicts with {source}",
+                )
+        return explicit_counts
+
+    if layer_type_counts is not None:
+        return layer_type_counts
+    if interval_counts is not None:
+        return interval_counts
+    return num_hidden_layers, 0
 
 
 @dataclass(frozen=True)
@@ -136,6 +266,12 @@ class ModelSpec:
             config = text_config
             prefix = "text_config"
 
+        if config.get("is_encoder_decoder") is True:
+            raise UnsupportedModelError(
+                _field_path(prefix, "is_encoder_decoder"),
+                "encoder-decoder models are unsupported",
+            )
+
         model_type = _string(config, "model_type", prefix)
         hidden_size = _required_positive(config, "hidden_size", prefix)
         num_hidden_layers = _required_positive(
@@ -180,6 +316,17 @@ class ModelSpec:
 
         if kv_lora_rank is not None:
             attention_kind = "mla"
+            mla_dimensions = {
+                "qk_nope_head_dim": qk_nope_head_dim,
+                "qk_rope_head_dim": qk_rope_head_dim,
+                "v_head_dim": v_head_dim,
+            }
+            for field, value in mla_dimensions.items():
+                if value is None:
+                    raise InputValidationError(
+                        _field_path(prefix, field),
+                        "field is required for MLA",
+                    )
         elif num_key_value_heads == num_attention_heads:
             attention_kind = "mha"
         elif num_key_value_heads == 1:
@@ -187,10 +334,17 @@ class ModelSpec:
         else:
             attention_kind = "gqa"
 
-        routed_fields = ("num_routed_experts", "num_experts")
-        routed_field, routed_value = _aliased_value(config, routed_fields, 0)
-        num_routed_experts = _nonnegative_integer(
-            routed_value, _field_path(prefix, routed_field)
+        routed_fields = (
+            "num_routed_experts",
+            "num_experts",
+            "n_routed_experts",
+        )
+        routed_field, num_routed_experts, _ = _aliased_value(
+            config,
+            routed_fields,
+            0,
+            prefix,
+            _nonnegative_integer,
         )
         if num_routed_experts == 1:
             raise InputValidationError(
@@ -199,12 +353,12 @@ class ModelSpec:
             )
 
         selected_fields = ("num_experts_per_tok", "num_experts_per_token")
-        selected_present = any(field in config for field in selected_fields)
-        selected_field, selected_value = _aliased_value(
-            config, selected_fields, 0
-        )
-        experts_per_token = _nonnegative_integer(
-            selected_value, _field_path(prefix, selected_field)
+        selected_field, experts_per_token, selected_present = _aliased_value(
+            config,
+            selected_fields,
+            0,
+            prefix,
+            _nonnegative_integer,
         )
         is_moe = num_routed_experts > 1
         if is_moe:
@@ -237,7 +391,7 @@ class ModelSpec:
             config, intermediate_field, prefix
         )
 
-        shared_count_present = "num_shared_experts" in config
+        shared_fields = ("num_shared_experts", "n_shared_experts")
         shared_size_present = "shared_expert_intermediate_size" in config
         total_shared_size = None
         if shared_size_present:
@@ -246,20 +400,20 @@ class ModelSpec:
                 _field_path(prefix, "shared_expert_intermediate_size"),
             )
 
-        if shared_count_present:
-            num_shared_experts = _positive_integer(
-                config["num_shared_experts"],
-                _field_path(prefix, "num_shared_experts"),
-            )
-        elif shared_size_present:
+        shared_field, num_shared_experts, shared_count_present = _aliased_value(
+            config,
+            shared_fields,
+            0,
+            prefix,
+            _positive_integer,
+        )
+        if not shared_count_present and shared_size_present:
             num_shared_experts = 1
-        else:
-            num_shared_experts = 0
 
         if num_shared_experts:
             if not is_moe:
                 shared_path = (
-                    "num_shared_experts"
+                    shared_field
                     if shared_count_present
                     else "shared_expert_intermediate_size"
                 )
@@ -280,52 +434,29 @@ class ModelSpec:
         else:
             shared_expert_intermediate_size = 0
 
-        full_present = "num_full_attention_layers" in config
-        linear_present = "num_linear_attention_layers" in config
-        if not full_present and not linear_present:
-            num_full_attention_layers = num_hidden_layers
-            num_linear_attention_layers = 0
-        else:
-            if full_present:
-                num_full_attention_layers = _nonnegative_integer(
-                    config["num_full_attention_layers"],
-                    _field_path(prefix, "num_full_attention_layers"),
-                )
-            else:
-                num_full_attention_layers = num_hidden_layers - _nonnegative_integer(
-                    config["num_linear_attention_layers"],
-                    _field_path(prefix, "num_linear_attention_layers"),
-                )
-            if linear_present:
-                num_linear_attention_layers = _nonnegative_integer(
-                    config["num_linear_attention_layers"],
-                    _field_path(prefix, "num_linear_attention_layers"),
-                )
-            else:
-                num_linear_attention_layers = (
-                    num_hidden_layers - num_full_attention_layers
-                )
-            if (
-                num_full_attention_layers < 0
-                or num_linear_attention_layers < 0
-                or num_full_attention_layers + num_linear_attention_layers
-                != num_hidden_layers
-            ):
-                raise InputValidationError(
-                    _field_path(prefix, "num_hidden_layers"),
-                    "must equal full plus linear attention layer counts",
-                )
+        (
+            num_full_attention_layers,
+            num_linear_attention_layers,
+        ) = _attention_layer_counts(config, prefix, num_hidden_layers)
 
+        linear_field_names = (
+            "linear_conv_kernel_dim",
+            "linear_key_head_dim",
+            "linear_num_key_heads",
+            "linear_value_head_dim",
+            "linear_num_value_heads",
+        )
         linear_fields = {
             field: _optional_positive(config, field, prefix)
-            for field in (
-                "linear_conv_kernel_dim",
-                "linear_key_head_dim",
-                "linear_num_key_heads",
-                "linear_value_head_dim",
-                "linear_num_value_heads",
-            )
+            for field in linear_field_names
         }
+        if num_linear_attention_layers > 0:
+            for field, value in linear_fields.items():
+                if value is None:
+                    raise InputValidationError(
+                        _field_path(prefix, field),
+                        "field is required for linear attention",
+                    )
 
         return cls(
             model_type=model_type,
