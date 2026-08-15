@@ -8,13 +8,16 @@ from infersim.search.pareto import (
     recommend,
     recommendation_sort_key,
 )
+from infersim.search.runner import SearchResult, run_stage_search
 
 __all__ = [
     "StageCandidate",
+    "SearchResult",
     "enumerate_plans",
     "evaluate_stage_constraints",
     "pareto_frontier",
     "recommend",
     "recommendation_sort_key",
+    "run_stage_search",
     "validate_plan",
 ]

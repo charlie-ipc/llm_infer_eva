@@ -3,7 +3,7 @@ from copy import deepcopy
 from infersim.cost import MemoryBreakdown, StageMetrics
 from infersim.schema.hardware import HardwareSpec
 from infersim.schema.model import ModelSpec
-from infersim.schema.parallel import ParallelPlan
+from infersim.schema.parallel import ParallelPlan, SearchSpace
 from infersim.schema.precision import PrecisionSpec
 from infersim.schema.scenario import ScenarioSet, WorkloadScenario
 from infersim.search import StageCandidate
@@ -205,6 +205,20 @@ def make_scenario_set(scenarios=None, **overrides):
     }
     values.update(deepcopy(overrides))
     return ScenarioSet(**values)
+
+
+def make_search_space(**overrides):
+    values = {
+        "total_cards": (1,),
+        "replicas": (1,),
+        "attention_tp": (1,),
+        "attention_dp": (1,),
+        "moe_tp": (1,),
+        "expert_parallel": (1,),
+        "batch_sizes": (2,),
+    }
+    values.update(deepcopy(overrides))
+    return SearchSpace(**values)
 
 
 def make_metrics(
