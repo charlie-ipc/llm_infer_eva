@@ -26,6 +26,17 @@ def by_name(shapes):
     return {shape.name: shape for shape in shapes}
 
 
+def gemm_useful_ops(shape):
+    return (
+        2
+        * shape.m
+        * shape.k
+        * shape.n
+        * shape.batch_repeats
+        * shape.repeats
+    )
+
+
 class DescriptorTests(unittest.TestCase):
     def test_cost_package_preserves_kernel_exports(self):
         self.assertTrue(
@@ -39,10 +50,14 @@ class DescriptorTests(unittest.TestCase):
         )
 
     def test_descriptors_are_frozen_and_normalize_integral_dimensions(self):
-        gemm = GemmShape("q", 2.0, 8, 4, repeats=3.0)
+        gemm = GemmShape(
+            "q", 2.0, 8, 4, repeats=3.0, batch_repeats=4.0
+        )
         vector = VectorShape("rope", 16.0, 6, repeats=2.0)
 
-        self.assertEqual((gemm.m, gemm.repeats), (2, 3))
+        self.assertEqual(
+            (gemm.m, gemm.repeats, gemm.batch_repeats), (2, 3, 4)
+        )
         self.assertEqual((vector.elements, vector.repeats), (16, 2))
         with self.assertRaises(FrozenInstanceError):
             gemm.m = 3
@@ -53,6 +68,8 @@ class DescriptorTests(unittest.TestCase):
             lambda: GemmShape("q", 0, 1, 1),
             lambda: GemmShape("q", True, 1, 1),
             lambda: GemmShape("q", 1.5, 1, 1),
+            lambda: GemmShape("q", 1, 1, 1, batch_repeats=0),
+            lambda: GemmShape("q", 1, 1, 1, batch_repeats=True),
             lambda: VectorShape("v", 1, 0),
             lambda: StageOperations(gemms=[], vectors=()),
             lambda: StageOperations(gemms=("not-a-shape",), vectors=()),
@@ -179,7 +196,19 @@ class DenseStageOperationTests(unittest.TestCase):
 
         self.assertEqual(prefill.gemms[0].m, 15)
         self.assertEqual(decode.gemms[0].m, 3)
-        self.assertTrue(all(type(value) is int for shape in decode.gemms for value in (shape.m, shape.k, shape.n, shape.repeats)))
+        self.assertTrue(
+            all(
+                type(value) is int
+                for shape in decode.gemms
+                for value in (
+                    shape.m,
+                    shape.k,
+                    shape.n,
+                    shape.repeats,
+                    shape.batch_repeats,
+                )
+            )
+        )
 
     def test_mha_projection_and_core_shapes_are_sharded_by_attention_tp(self):
         model = make_dense_model(
@@ -203,8 +232,26 @@ class DenseStageOperationTests(unittest.TestCase):
         self.assertEqual(gemms["attention.k_proj"], GemmShape("attention.k_proj", 3, 8, 2, 2))
         self.assertEqual(gemms["attention.v_proj"], GemmShape("attention.v_proj", 3, 8, 2, 2))
         self.assertEqual(gemms["attention.o_proj"], GemmShape("attention.o_proj", 3, 4, 8, 2))
-        self.assertEqual(gemms["attention.qk"], GemmShape("attention.qk", 3, 4, 11, 2))
-        self.assertEqual(gemms["attention.pv"], GemmShape("attention.pv", 3, 11, 4, 2))
+        self.assertEqual(
+            gemms["attention.qk"],
+            GemmShape(
+                "attention.qk", 3, 2, 11, 2, batch_repeats=2
+            ),
+        )
+        self.assertEqual(
+            gemms["attention.pv"],
+            GemmShape(
+                "attention.pv", 3, 11, 2, 2, batch_repeats=2
+            ),
+        )
+        self.assertEqual(
+            gemm_useful_ops(gemms["attention.qk"]),
+            2 * 3 * 4 * 11 * 2,
+        )
+        self.assertEqual(
+            gemm_useful_ops(gemms["attention.pv"]),
+            2 * 3 * 11 * 4 * 2,
+        )
 
     def test_attention_gate_changes_q_shape_and_adds_gate_vector(self):
         model = make_dense_model(attention_output_gate=True)
@@ -220,7 +267,8 @@ class DenseStageOperationTests(unittest.TestCase):
         vectors = by_name(ops.vectors)
 
         self.assertEqual(gemms["attention.q_proj"].n, 2 * 2 * 4)
-        self.assertEqual(gemms["attention.qk"].k, 2 * 4)
+        self.assertEqual(gemms["attention.qk"].k, 4)
+        self.assertEqual(gemms["attention.qk"].batch_repeats, 2)
         self.assertEqual(vectors["attention.output_gate"], VectorShape("attention.output_gate", 3 * 2 * 4, 6, 2))
 
     def test_dense_ffn_and_common_vectors_have_expected_constants(self):
@@ -279,8 +327,9 @@ class MlaAndMoeStageOperationTests(unittest.TestCase):
         self.assertEqual(vectors["residual.ffn"].elements, 5 * 16)
         self.assertEqual(vectors["moe.routing"].elements, 5 * 8)
         self.assertEqual(gemms["moe.routed_gate_proj"].m, 4)
-        self.assertEqual(gemms["moe.routed_gate_proj"].repeats, 8)
-        self.assertEqual(gemms["moe.shared_gate_proj"].m, 5)
+        self.assertEqual(gemms["moe.routed_gate_proj"].repeats, 2)
+        self.assertEqual(gemms["moe.routed_gate_proj"].batch_repeats, 4)
+        self.assertEqual(gemms["ffn.shared_gate_up"].m, 5)
 
     def test_mla_prefill_uses_no_absorb_shapes(self):
         ops = stage_operations(
@@ -297,8 +346,25 @@ class MlaAndMoeStageOperationTests(unittest.TestCase):
         self.assertEqual(gemms["attention.q_up_proj"], GemmShape("attention.q_up_proj", 6, 4, 8, 2))
         self.assertEqual(gemms["attention.kv_down_proj"], GemmShape("attention.kv_down_proj", 6, 16, 5, 2))
         self.assertEqual(gemms["attention.kv_up_proj"], GemmShape("attention.kv_up_proj", 6, 3, 10, 2))
-        self.assertEqual(gemms["attention.qk"], GemmShape("attention.qk", 6, 8, 3, 2))
-        self.assertEqual(gemms["attention.pv"], GemmShape("attention.pv", 6, 3, 6, 2))
+        self.assertEqual(
+            gemms["attention.qk"],
+            GemmShape(
+                "attention.qk", 6, 4, 3, 2, batch_repeats=2
+            ),
+        )
+        self.assertEqual(
+            gemms["attention.pv"],
+            GemmShape(
+                "attention.pv", 6, 3, 3, 2, batch_repeats=2
+            ),
+        )
+        self.assertEqual(
+            sum(
+                gemm_useful_ops(gemms[name])
+                for name in ("attention.qk", "attention.pv")
+            ),
+            2 * 6 * 8 * 3 * 2 + 2 * 6 * 3 * 6 * 2,
+        )
         self.assertNotIn("attention.q_wk", gemms)
 
     def test_mla_decode_uses_absorb_shapes_and_integral_context(self):
@@ -312,10 +378,47 @@ class MlaAndMoeStageOperationTests(unittest.TestCase):
         )
         gemms = by_name(ops.gemms)
 
-        self.assertEqual(gemms["attention.q_wk"], GemmShape("attention.q_wk", 2, 4, 3, 2))
-        self.assertEqual(gemms["attention.o_wv"], GemmShape("attention.o_wv", 2, 6, 3, 2))
-        self.assertEqual(gemms["attention.qk"], GemmShape("attention.qk", 2, 10, 9, 2))
-        self.assertEqual(gemms["attention.pv"], GemmShape("attention.pv", 2, 9, 6, 2))
+        self.assertEqual(
+            gemms["attention.q_wk"],
+            GemmShape(
+                "attention.q_wk", 2, 2, 3, 2, batch_repeats=2
+            ),
+        )
+        self.assertEqual(
+            gemms["attention.o_wv"],
+            GemmShape(
+                "attention.o_wv", 2, 3, 3, 2, batch_repeats=2
+            ),
+        )
+        self.assertEqual(
+            gemms["attention.qk"],
+            GemmShape(
+                "attention.qk", 2, 5, 9, 2, batch_repeats=2
+            ),
+        )
+        self.assertEqual(
+            gemms["attention.pv"],
+            GemmShape(
+                "attention.pv", 2, 9, 3, 2, batch_repeats=2
+            ),
+        )
+        self.assertEqual(
+            sum(
+                gemm_useful_ops(gemms[name])
+                for name in (
+                    "attention.q_wk",
+                    "attention.o_wv",
+                    "attention.qk",
+                    "attention.pv",
+                )
+            ),
+            (
+                2 * 2 * 4 * 3 * 2
+                + 2 * 2 * 6 * 3 * 2
+                + 2 * 2 * 10 * 9 * 2
+                + 2 * 2 * 9 * 6 * 2
+            ),
+        )
         self.assertEqual(gemms["attention.o_proj"], GemmShape("attention.o_proj", 2, 6, 16, 2))
         self.assertNotIn("attention.kv_up_proj", gemms)
 
@@ -350,10 +453,37 @@ class MlaAndMoeStageOperationTests(unittest.TestCase):
         vectors = by_name(ops.vectors)
 
         # ceil(5 * 3 / 4) = 4 assignments, two local experts, two tokens each.
-        self.assertEqual(gemms["moe.routed_gate_proj"], GemmShape("moe.routed_gate_proj", 2, 16, 8, 4))
-        self.assertEqual(gemms["moe.routed_down_proj"], GemmShape("moe.routed_down_proj", 2, 8, 16, 4))
+        self.assertEqual(
+            gemms["moe.routed_gate_proj"],
+            GemmShape(
+                "moe.routed_gate_proj",
+                2,
+                16,
+                8,
+                2,
+                batch_repeats=2,
+            ),
+        )
+        self.assertEqual(
+            gemms["moe.routed_down_proj"],
+            GemmShape(
+                "moe.routed_down_proj",
+                2,
+                8,
+                16,
+                2,
+                batch_repeats=2,
+            ),
+        )
+        self.assertEqual(
+            gemm_useful_ops(gemms["moe.routed_gate_proj"]),
+            2 * 2 * 16 * 8 * 4,
+        )
         self.assertEqual(vectors["moe.routing"], VectorShape("moe.routing", 3 * 8, 4, 2))
-        self.assertEqual(vectors["moe.routed_silu_gate"], VectorShape("moe.routed_silu_gate", 2 * 8, 6, 4))
+        self.assertEqual(
+            vectors["moe.routed_silu_gate"],
+            VectorShape("moe.routed_silu_gate", 2 * 8 * 2, 6, 2),
+        )
 
     def test_shared_experts_are_dp_split_moe_tp_sharded_and_ep_replicated(self):
         model = make_mla_moe_model()
@@ -374,9 +504,29 @@ class MlaAndMoeStageOperationTests(unittest.TestCase):
         gemms = by_name(ops.gemms)
         vectors = by_name(ops.vectors)
 
-        self.assertEqual(gemms["moe.shared_gate_proj"], GemmShape("moe.shared_gate_proj", 3, 16, 3, 4))
-        self.assertEqual(gemms["moe.shared_down_proj"], GemmShape("moe.shared_down_proj", 3, 3, 16, 4))
-        self.assertEqual(vectors["moe.shared_silu_gate"], VectorShape("moe.shared_silu_gate", 3 * 3, 6, 4))
+        self.assertEqual(
+            gemms["ffn.shared_gate_up"],
+            GemmShape("ffn.shared_gate_up", 3, 16, 12, 2),
+        )
+        self.assertEqual(
+            gemms["ffn.shared_down"],
+            GemmShape("ffn.shared_down", 3, 6, 16, 2),
+        )
+        self.assertEqual(
+            [shape.name for shape in ops.gemms[-2:]],
+            ["ffn.shared_gate_up", "ffn.shared_down"],
+        )
+        self.assertEqual(
+            sum(
+                gemm_useful_ops(gemms[name])
+                for name in ("ffn.shared_gate_up", "ffn.shared_down")
+            ),
+            3 * (2 * 3 * 16 * 3 * 4),
+        )
+        self.assertEqual(
+            vectors["ffn.shared_silu_gate"],
+            VectorShape("ffn.shared_silu_gate", 3 * 2 * 3, 6, 2),
+        )
 
 
 class HybridStageOperationTests(unittest.TestCase):

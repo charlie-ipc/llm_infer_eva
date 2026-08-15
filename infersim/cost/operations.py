@@ -43,15 +43,22 @@ def _ceil_div(value: int, divisor: int) -> int:
 
 @dataclass(frozen=True)
 class GemmShape:
+    """One GEMM shape with independent and in-launch repetition counts.
+
+    ``repeats`` counts independent kernel launches. ``batch_repeats`` counts
+    equal-shape work performed within each batched or grouped launch.
+    """
+
     name: str
     m: int
     k: int
     n: int
     repeats: int = 1
+    batch_repeats: int = 1
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", _name(self.name, "name"))
-        for field in ("m", "k", "n", "repeats"):
+        for field in ("m", "k", "n", "repeats", "batch_repeats"):
             object.__setattr__(
                 self,
                 field,
@@ -61,6 +68,8 @@ class GemmShape:
 
 @dataclass(frozen=True)
 class VectorShape:
+    """One vector shape whose ``repeats`` count independent launches."""
+
     name: str
     elements: int
     ops_per_element: int
@@ -274,8 +283,22 @@ def _mha_operations(
         GemmShape(
             "attention.o_proj", m, q_width, model.hidden_size, repeats
         ),
-        GemmShape("attention.qk", m, q_width, context, repeats),
-        GemmShape("attention.pv", m, context, q_width, repeats),
+        GemmShape(
+            "attention.qk",
+            m,
+            model.head_dim,
+            context,
+            repeats,
+            batch_repeats=local_q_heads,
+        ),
+        GemmShape(
+            "attention.pv",
+            m,
+            context,
+            model.head_dim,
+            repeats,
+            batch_repeats=local_q_heads,
+        ),
     ]
     vectors = [
         VectorShape(
@@ -356,8 +379,22 @@ def _mla_operations(
                     * (model.qk_nope_head_dim + model.v_head_dim),
                     repeats,
                 ),
-                GemmShape("attention.qk", m, local_qk_width, context, repeats),
-                GemmShape("attention.pv", m, context, local_v_width, repeats),
+                GemmShape(
+                    "attention.qk",
+                    m,
+                    qk_dim,
+                    context,
+                    repeats,
+                    batch_repeats=local_heads,
+                ),
+                GemmShape(
+                    "attention.pv",
+                    m,
+                    context,
+                    model.v_head_dim,
+                    repeats,
+                    batch_repeats=local_heads,
+                ),
                 GemmShape(
                     "attention.o_proj",
                     m,
@@ -373,31 +410,34 @@ def _mla_operations(
                 GemmShape(
                     "attention.q_wk",
                     m,
-                    local_heads * model.qk_nope_head_dim,
+                    model.qk_nope_head_dim,
                     model.kv_lora_rank,
                     repeats,
+                    batch_repeats=local_heads,
                 ),
                 GemmShape(
                     "attention.o_wv",
                     m,
-                    local_heads * model.kv_lora_rank,
+                    model.kv_lora_rank,
                     model.v_head_dim,
                     repeats,
+                    batch_repeats=local_heads,
                 ),
                 GemmShape(
                     "attention.qk",
                     m,
-                    local_heads
-                    * (model.kv_lora_rank + model.qk_rope_head_dim),
+                    model.kv_lora_rank + model.qk_rope_head_dim,
                     context,
                     repeats,
+                    batch_repeats=local_heads,
                 ),
                 GemmShape(
                     "attention.pv",
                     m,
                     context,
-                    local_heads * model.kv_lora_rank,
+                    model.kv_lora_rank,
                     repeats,
+                    batch_repeats=local_heads,
                 ),
                 GemmShape(
                     "attention.o_proj",
@@ -514,28 +554,30 @@ def _ffn_operations(
     active_local = min(local_experts, local_assignments)
     tokens_per_active = _ceil_div(local_assignments, active_local)
     local_intermediate = model.intermediate_size // plan.moe_tp
-    routed_repeats = active_local * layers
     gemms = [
         GemmShape(
             "moe.routed_gate_proj",
             tokens_per_active,
             model.hidden_size,
             local_intermediate,
-            routed_repeats,
+            layers,
+            batch_repeats=active_local,
         ),
         GemmShape(
             "moe.routed_up_proj",
             tokens_per_active,
             model.hidden_size,
             local_intermediate,
-            routed_repeats,
+            layers,
+            batch_repeats=active_local,
         ),
         GemmShape(
             "moe.routed_down_proj",
             tokens_per_active,
             local_intermediate,
             model.hidden_size,
-            routed_repeats,
+            layers,
+            batch_repeats=active_local,
         ),
     ]
     vectors = [
@@ -547,9 +589,9 @@ def _ffn_operations(
         ),
         VectorShape(
             "moe.routed_silu_gate",
-            tokens_per_active * local_intermediate,
+            tokens_per_active * local_intermediate * active_local,
             6,
-            routed_repeats,
+            layers,
         ),
     ]
 
@@ -564,38 +606,31 @@ def _ffn_operations(
         local_shared_intermediate = (
             model.shared_expert_intermediate_size // plan.moe_tp
         )
-        shared_repeats = model.num_shared_experts * layers
+        shared_width = model.num_shared_experts * local_shared_intermediate
         gemms.extend(
             (
                 GemmShape(
-                    "moe.shared_gate_proj",
+                    "ffn.shared_gate_up",
                     shared_m,
                     model.hidden_size,
-                    local_shared_intermediate,
-                    shared_repeats,
+                    2 * shared_width,
+                    layers,
                 ),
                 GemmShape(
-                    "moe.shared_up_proj",
+                    "ffn.shared_down",
                     shared_m,
+                    shared_width,
                     model.hidden_size,
-                    local_shared_intermediate,
-                    shared_repeats,
-                ),
-                GemmShape(
-                    "moe.shared_down_proj",
-                    shared_m,
-                    local_shared_intermediate,
-                    model.hidden_size,
-                    shared_repeats,
+                    layers,
                 ),
             )
         )
         vectors.append(
             VectorShape(
-                "moe.shared_silu_gate",
-                shared_m * local_shared_intermediate,
+                "ffn.shared_silu_gate",
+                shared_m * shared_width,
                 6,
-                shared_repeats,
+                layers,
             )
         )
     return gemms, vectors
@@ -610,6 +645,8 @@ def stage_operations(
     average_context: int,
     plan: ParallelPlan,
 ) -> StageOperations:
+    """Describe per-card work while preserving independent launch counts."""
+
     if not isinstance(model, ModelSpec):
         raise InputValidationError("model", "must be a ModelSpec")
     if stage not in ("prefill", "decode"):
