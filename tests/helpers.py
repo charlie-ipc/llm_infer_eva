@@ -1,10 +1,12 @@
 from copy import deepcopy
 
+from infersim.cost import MemoryBreakdown, StageMetrics
 from infersim.schema.hardware import HardwareSpec
 from infersim.schema.model import ModelSpec
 from infersim.schema.parallel import ParallelPlan
 from infersim.schema.precision import PrecisionSpec
 from infersim.schema.scenario import ScenarioSet, WorkloadScenario
+from infersim.search import StageCandidate
 
 
 def make_hardware_dict(**overrides):
@@ -203,3 +205,114 @@ def make_scenario_set(scenarios=None, **overrides):
     }
     values.update(deepcopy(overrides))
     return ScenarioSet(**values)
+
+
+def make_metrics(
+    *,
+    name="interactive",
+    stage="prefill",
+    ttft_ms=50.0,
+    tpot_ms=10.0,
+    request_capacity=10.0,
+    memory_feasible=True,
+    max_supported_concurrency=4,
+    plan=None,
+):
+    plan = plan or make_dense_plan()
+    latency_ms = ttft_ms if stage == "prefill" else tpot_ms
+    memory = MemoryBreakdown(
+        stage=stage,
+        embedding_weight_bytes=1.0,
+        attention_weight_bytes=1.0,
+        linear_attention_weight_bytes=0.0,
+        dense_ffn_weight_bytes=1.0,
+        routed_expert_weight_bytes=0.0,
+        shared_expert_weight_bytes=0.0,
+        total_weight_bytes=3.0,
+        kv_bytes_per_card=1.0,
+        recurrent_state_bytes_per_card=0.0,
+        activation_bytes_per_card=1.0,
+        workspace_bytes=1.0,
+        reserved_bytes=1.0,
+        resident_bytes=5.0,
+        total_required_bytes=7.0,
+        capacity_bytes=10.0,
+        usable_bytes=8.0,
+        capacity_margin_bytes=3.0 if memory_feasible else -1.0,
+        feasible=memory_feasible,
+    )
+    latency_seconds = latency_ms / 1000
+    return StageMetrics(
+        stage=stage,
+        scenario_name=name,
+        plan=plan,
+        latency_seconds=latency_seconds,
+        tpot_seconds=latency_seconds if stage == "decode" else None,
+        prompt_token_capacity=(request_capacity * 128 if stage == "prefill" else None),
+        output_token_capacity=(request_capacity * 32 if stage == "decode" else None),
+        request_capacity=request_capacity,
+        average_context_length=128.0,
+        gemm_seconds=latency_seconds,
+        vector_seconds=0.0,
+        tp_seconds=0.0,
+        ep_seconds=0.0,
+        useful_gemm_ops=1,
+        aligned_gemm_ops=1,
+        useful_vector_ops=1,
+        aligned_vector_ops=1,
+        memory=memory,
+        component_seconds={"gemm": latency_seconds},
+        max_supported_batch=plan.batch_size,
+        max_supported_concurrency=max_supported_concurrency,
+    )
+
+
+def make_stage_candidate(
+    *,
+    candidate_id="candidate",
+    plan=None,
+    metrics=None,
+    feasible=True,
+    reason_codes=(),
+    warnings=(),
+    total_cards=None,
+    hourly_cost=None,
+    request_capacity=0.0,
+    request_capacity_per_card=0.0,
+    ttft_ms=None,
+    tpot_ms=None,
+    scenarios=None,
+):
+    plan = plan or make_dense_plan()
+    metrics = tuple(metrics) if metrics is not None else (
+        make_metrics(plan=plan),
+    )
+    if scenarios is None:
+        scenarios = tuple(
+            make_scenario(
+                name=metric.scenario_name,
+                ttft_limit_ms=100.0,
+                tpot_limit_ms=20.0,
+                request_rate=1.0,
+                concurrency=1,
+            )
+            for metric in metrics
+        )
+    return StageCandidate(
+        candidate_id=candidate_id,
+        plan=plan,
+        metrics=metrics,
+        feasible=feasible,
+        reason_codes=reason_codes,
+        warnings=warnings,
+        total_cards=plan.total_cards if total_cards is None else total_cards,
+        hourly_cost=hourly_cost,
+        request_capacity=request_capacity,
+        request_capacity_per_card=request_capacity_per_card,
+        ttft_ms=ttft_ms,
+        tpot_ms=tpot_ms,
+        scenarios=scenarios,
+    )
+
+
+make_candidate = make_stage_candidate
