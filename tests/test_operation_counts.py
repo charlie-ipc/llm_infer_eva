@@ -248,6 +248,40 @@ class DenseStageOperationTests(unittest.TestCase):
 
 
 class MlaAndMoeStageOperationTests(unittest.TestCase):
+    def test_attention_dp_splits_local_work_but_not_routed_assignments(self):
+        model = make_mla_moe_model(
+            num_routed_experts=8,
+            num_experts_per_tok=3,
+        )
+        plan = make_moe_plan(
+            attention_tp=2,
+            attention_dp=2,
+            moe_tp=2,
+            expert_parallel=2,
+        )
+        ops = stage_operations(
+            model,
+            stage="prefill",
+            batch_size=3,
+            input_length=3,
+            average_context=3,
+            plan=plan,
+        )
+        gemms = by_name(ops.gemms)
+        vectors = by_name(ops.vectors)
+
+        # Nine replica tokens become five local attention tokens. Routed
+        # assignments remain ceil(9 * 3 / 2) = 14 across four local experts.
+        self.assertEqual(gemms["attention.q_down_proj"].m, 5)
+        self.assertEqual(vectors["attention.rope"].elements, 5 * 3 * 2)
+        self.assertEqual(vectors["attention.softmax"].elements, 5 * 2 * 3)
+        self.assertEqual(vectors["norm.input"].elements, 5 * 16)
+        self.assertEqual(vectors["residual.ffn"].elements, 5 * 16)
+        self.assertEqual(vectors["moe.routing"].elements, 5 * 8)
+        self.assertEqual(gemms["moe.routed_gate_proj"].m, 4)
+        self.assertEqual(gemms["moe.routed_gate_proj"].repeats, 8)
+        self.assertEqual(gemms["moe.shared_gate_proj"].m, 5)
+
     def test_mla_prefill_uses_no_absorb_shapes(self):
         ops = stage_operations(
             make_mla_moe_model(),
@@ -318,7 +352,7 @@ class MlaAndMoeStageOperationTests(unittest.TestCase):
         # ceil(5 * 3 / 4) = 4 assignments, two local experts, two tokens each.
         self.assertEqual(gemms["moe.routed_gate_proj"], GemmShape("moe.routed_gate_proj", 2, 16, 8, 4))
         self.assertEqual(gemms["moe.routed_down_proj"], GemmShape("moe.routed_down_proj", 2, 8, 16, 4))
-        self.assertEqual(vectors["moe.routing"], VectorShape("moe.routing", 5 * 8, 4, 2))
+        self.assertEqual(vectors["moe.routing"], VectorShape("moe.routing", 3 * 8, 4, 2))
         self.assertEqual(vectors["moe.routed_silu_gate"], VectorShape("moe.routed_silu_gate", 2 * 8, 6, 4))
 
     def test_shared_experts_are_dp_split_moe_tp_sharded_and_ep_replicated(self):

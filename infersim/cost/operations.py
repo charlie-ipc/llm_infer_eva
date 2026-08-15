@@ -467,7 +467,8 @@ def _linear_attention_operations(
 def _ffn_operations(
     model: ModelSpec,
     plan: ParallelPlan,
-    m: int,
+    replica_tokens: int,
+    attention_tokens: int,
 ) -> tuple[list[GemmShape], list[VectorShape]]:
     layers = model.num_hidden_layers
     if not model.is_moe:
@@ -476,21 +477,21 @@ def _ffn_operations(
             [
                 GemmShape(
                     "ffn.gate_proj",
-                    m,
+                    attention_tokens,
                     model.hidden_size,
                     local_intermediate,
                     layers,
                 ),
                 GemmShape(
                     "ffn.up_proj",
-                    m,
+                    attention_tokens,
                     model.hidden_size,
                     local_intermediate,
                     layers,
                 ),
                 GemmShape(
                     "ffn.down_proj",
-                    m,
+                    attention_tokens,
                     local_intermediate,
                     model.hidden_size,
                     layers,
@@ -498,14 +499,17 @@ def _ffn_operations(
             ],
             [
                 VectorShape(
-                    "ffn.silu_gate", m * local_intermediate, 6, layers
+                    "ffn.silu_gate",
+                    attention_tokens * local_intermediate,
+                    6,
+                    layers,
                 )
             ],
         )
 
     local_experts = model.num_routed_experts // plan.expert_parallel
     local_assignments = _ceil_div(
-        m * model.experts_per_token, plan.expert_parallel
+        replica_tokens * model.experts_per_token, plan.expert_parallel
     )
     active_local = min(local_experts, local_assignments)
     tokens_per_active = _ceil_div(local_assignments, active_local)
@@ -536,7 +540,10 @@ def _ffn_operations(
     ]
     vectors = [
         VectorShape(
-            "moe.routing", m * model.num_routed_experts, 4, layers
+            "moe.routing",
+            attention_tokens * model.num_routed_experts,
+            4,
+            layers,
         ),
         VectorShape(
             "moe.routed_silu_gate",
@@ -553,7 +560,7 @@ def _ffn_operations(
                 "SHARED_INTERMEDIATE_NOT_DIVISIBLE: shared expert "
                 "intermediate size must be divisible by moe_tp",
             )
-        shared_m = _ceil_div(m, plan.attention_dp)
+        shared_m = attention_tokens
         local_shared_intermediate = (
             model.shared_expert_intermediate_size // plan.moe_tp
         )
@@ -620,51 +627,58 @@ def stage_operations(
             "plan", f"{validation.reason_code}: {validation.reason}"
         )
 
-    m = batch_size * input_length if stage == "prefill" else batch_size
+    replica_tokens = (
+        batch_size * input_length if stage == "prefill" else batch_size
+    )
+    attention_tokens = _ceil_div(replica_tokens, plan.attention_dp)
     gemms: list[GemmShape] = []
     vectors: list[VectorShape] = []
 
     if model.num_full_attention_layers:
         if model.attention_kind == "mla":
             attention_gemms, attention_vectors = _mla_operations(
-                model, plan, stage, m, average_context
+                model, plan, stage, attention_tokens, average_context
             )
         else:
             attention_gemms, attention_vectors = _mha_operations(
-                model, plan, m, average_context
+                model, plan, attention_tokens, average_context
             )
         gemms.extend(attention_gemms)
         vectors.extend(attention_vectors)
 
-    linear_gemms, linear_vectors = _linear_attention_operations(model, m)
+    linear_gemms, linear_vectors = _linear_attention_operations(
+        model, attention_tokens
+    )
     gemms.extend(linear_gemms)
     vectors.extend(linear_vectors)
 
-    ffn_gemms, ffn_vectors = _ffn_operations(model, plan, m)
+    ffn_gemms, ffn_vectors = _ffn_operations(
+        model, plan, replica_tokens, attention_tokens
+    )
     gemms.extend(ffn_gemms)
     vectors.extend(
         (
             VectorShape(
                 "norm.input",
-                m * model.hidden_size,
+                attention_tokens * model.hidden_size,
                 5,
                 model.num_hidden_layers,
             ),
             VectorShape(
                 "norm.post_attention",
-                m * model.hidden_size,
+                attention_tokens * model.hidden_size,
                 5,
                 model.num_hidden_layers,
             ),
             VectorShape(
                 "residual.attention",
-                m * model.hidden_size,
+                attention_tokens * model.hidden_size,
                 1,
                 model.num_hidden_layers,
             ),
             VectorShape(
                 "residual.ffn",
-                m * model.hidden_size,
+                attention_tokens * model.hidden_size,
                 1,
                 model.num_hidden_layers,
             ),
