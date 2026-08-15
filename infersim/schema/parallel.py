@@ -87,3 +87,29 @@ class SearchSpace:
             for axis in _AXES
         }
         return cls(**values)
+
+
+@dataclass(frozen=True, order=True)
+class ParallelPlan:
+    replicas: int
+    attention_tp: int
+    attention_dp: int
+    moe_tp: int
+    expert_parallel: int
+    batch_size: int
+
+    @property
+    def cards_per_replica(self) -> int:
+        return self.attention_tp * self.attention_dp
+
+    @property
+    def total_cards(self) -> int:
+        return self.replicas * self.cards_per_replica
+
+
+@dataclass(frozen=True)
+class PlanValidation:
+    plan: ParallelPlan
+    feasible: bool
+    reason_code: str | None = None
+    reason: str | None = None
