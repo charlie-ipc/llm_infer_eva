@@ -76,6 +76,7 @@ class StageCandidate:
     scenarios: tuple[WorkloadScenario, ...] = ()
 
     def __post_init__(self) -> None:
+        from infersim.cost.memory import MemoryBreakdown
         from infersim.cost.types import StageMetrics
 
         if not isinstance(self.candidate_id, str) or not self.candidate_id:
@@ -85,8 +86,21 @@ class StageCandidate:
         if not isinstance(self.plan, ParallelPlan):
             raise InputValidationError("plan", "must be a ParallelPlan")
         metrics = _record_tuple(self.metrics, "metrics", StageMetrics)
-        if not metrics:
-            raise InputValidationError("metrics", "must not be empty")
+        for index, metric in enumerate(metrics):
+            if metric.plan != self.plan:
+                raise InputValidationError(
+                    f"metrics[{index}].plan", "must equal candidate plan"
+                )
+            if not isinstance(metric.memory, MemoryBreakdown):
+                raise InputValidationError(
+                    f"metrics[{index}].memory",
+                    "must be a MemoryBreakdown",
+                )
+            if metric.memory.stage != metric.stage:
+                raise InputValidationError(
+                    f"metrics[{index}].memory.stage",
+                    "must equal metric stage",
+                )
         if type(self.feasible) is not bool:
             raise InputValidationError("feasible", "must be a boolean")
         reason_codes = _string_tuple(self.reason_codes, "reason_codes")
@@ -109,6 +123,30 @@ class StageCandidate:
         scenario_values = _record_tuple(
             self.scenarios, "scenarios", WorkloadScenario
         )
+        if not metrics:
+            if self.feasible or not reason_codes:
+                raise InputValidationError(
+                    "metrics",
+                    "may be empty only for an infeasible candidate with reasons",
+                )
+            if scenario_values:
+                raise InputValidationError(
+                    "scenarios", "must be empty when metrics is empty"
+                )
+            placeholders = (
+                ("request_capacity", self.request_capacity),
+                (
+                    "request_capacity_per_card",
+                    self.request_capacity_per_card,
+                ),
+                ("ttft_ms", self.ttft_ms),
+                ("tpot_ms", self.tpot_ms),
+            )
+            for path, value in placeholders:
+                if value not in (0, None):
+                    raise InputValidationError(
+                        path, "must be 0 or None when metrics is empty"
+                    )
         object.__setattr__(self, "metrics", metrics)
         object.__setattr__(self, "reason_codes", reason_codes)
         object.__setattr__(self, "warnings", warnings)
@@ -192,7 +230,7 @@ def _match_scenarios(
             )
         by_name[scenario.name] = scenario
 
-    missing = [name for name in metric_names if name not in by_name]
+    missing = sorted(name for name in metric_names if name not in by_name)
     if missing:
         raise InputValidationError(
             "scenarios", f"missing scenario named '{missing[0]}'"
@@ -234,6 +272,12 @@ def evaluate_stage_constraints(
         raise InputValidationError(
             "candidate.feasible",
             "cannot be false when reason_codes is empty",
+        )
+    if not candidate.metrics:
+        return replace(
+            candidate,
+            reason_codes=_stable_unique(candidate.reason_codes),
+            warnings=_stable_unique(candidate.warnings),
         )
 
     scenario_values = _scenario_values(candidate, policy, scenarios)

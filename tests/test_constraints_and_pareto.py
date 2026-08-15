@@ -21,6 +21,61 @@ from tests.helpers import (
 
 
 class StageCandidateTests(unittest.TestCase):
+    def test_invalid_plan_candidate_can_omit_metrics_and_scenarios(self):
+        candidate = make_candidate(
+            metrics=(),
+            scenarios=(),
+            feasible=False,
+            reason_codes=("INVALID_PLAN", "INVALID_PLAN"),
+            warnings=("diagnostic", "diagnostic"),
+        )
+
+        result = evaluate_stage_constraints(candidate, "all")
+
+        self.assertFalse(result.feasible)
+        self.assertEqual(result.metrics, ())
+        self.assertEqual(result.scenarios, ())
+        self.assertEqual(result.reason_codes, ("INVALID_PLAN",))
+        self.assertEqual(result.warnings, ("diagnostic",))
+        self.assertEqual(result.request_capacity, 0)
+        self.assertEqual(result.request_capacity_per_card, 0)
+        self.assertIsNone(result.ttft_ms)
+        self.assertIsNone(result.tpot_ms)
+
+    def test_empty_metrics_requires_a_hard_reason_and_raw_placeholders(self):
+        with self.assertRaises(InputValidationError) as caught:
+            make_candidate(metrics=(), scenarios=())
+        self.assertEqual(caught.exception.path, "metrics")
+
+        with self.assertRaises(InputValidationError) as caught:
+            make_candidate(
+                metrics=(),
+                scenarios=(),
+                feasible=False,
+                reason_codes=("INVALID_PLAN",),
+                request_capacity=1,
+            )
+        self.assertEqual(caught.exception.path, "request_capacity")
+
+    def test_nonempty_metrics_match_candidate_plan_and_memory_stage(self):
+        candidate_plan = make_dense_plan()
+        other_plan = make_dense_plan(batch_size=4)
+        with self.assertRaises(InputValidationError) as caught:
+            make_candidate(
+                plan=candidate_plan,
+                metrics=[make_metrics(plan=other_plan)],
+            )
+        self.assertEqual(caught.exception.path, "metrics[0].plan")
+
+        metric = make_metrics(stage="prefill", plan=candidate_plan)
+        mismatched_memory = replace(metric.memory, stage="decode")
+        with self.assertRaises(InputValidationError) as caught:
+            make_candidate(
+                plan=candidate_plan,
+                metrics=[replace(metric, memory=mismatched_memory)],
+            )
+        self.assertEqual(caught.exception.path, "metrics[0].memory.stage")
+
     def test_public_record_has_exact_fields_and_is_deeply_immutable(self):
         candidate = make_candidate(
             metrics=[make_metrics()],
@@ -262,6 +317,23 @@ class ConstraintTests(unittest.TestCase):
                     evaluate_stage_constraints(candidate, "all")
                 self.assertEqual(caught.exception.path, path)
 
+    def test_missing_scenario_error_uses_sorted_metric_name(self):
+        metric_names = ("zulu", "alpha", "middle", "beta")
+        candidate = make_candidate(
+            metrics=[make_metrics(name=name) for name in metric_names],
+            scenarios=[
+                make_scenario(name=f"other-{index}")
+                for index in range(len(metric_names))
+            ],
+        )
+
+        with self.assertRaises(InputValidationError) as caught:
+            evaluate_stage_constraints(candidate, "all")
+
+        self.assertEqual(
+            caught.exception.message, "missing scenario named 'alpha'"
+        )
+
     def test_rejects_bad_policy_candidate_state_and_nonpositive_weight(self):
         invalid_calls = (
             (lambda: evaluate_stage_constraints(object(), "all"), "candidate"),
@@ -367,6 +439,35 @@ class RecommendationTests(unittest.TestCase):
         worse = self.candidate("worse", cost=2, ttft=20, capacity=10)
 
         self.assertEqual(pareto_frontier([worse, better]), [better])
+
+    def test_pareto_activates_optional_objectives_for_the_whole_set(self):
+        missing_optional = self.candidate(
+            "missing", capacity=8, cost=None, ttft=None
+        )
+        capacity_winner = self.candidate(
+            "capacity", capacity=10, cost=2, ttft=20
+        )
+        optional_winner = self.candidate(
+            "optional", capacity=9, cost=1, ttft=10
+        )
+
+        self.assertEqual(
+            pareto_frontier(
+                [missing_optional, capacity_winner, optional_winner]
+            ),
+            [capacity_winner],
+        )
+
+    def test_pareto_semantically_deduplicates_with_deterministic_id(self):
+        larger_id = self.candidate("z-candidate", capacity=20, ttft=10)
+        smaller_id = self.candidate("a-candidate", capacity=20, ttft=10)
+        self.assertIsNot(larger_id, smaller_id)
+
+        forward = pareto_frontier([larger_id, smaller_id])
+        reverse = pareto_frontier([smaller_id, larger_id])
+
+        self.assertEqual(forward, [smaller_id])
+        self.assertEqual(reverse, [smaller_id])
 
 
 if __name__ == "__main__":
