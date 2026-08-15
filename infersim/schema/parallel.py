@@ -25,7 +25,7 @@ def _powers_of_two(maximum: int) -> tuple[int, ...]:
     return tuple(values)
 
 
-def _axis(value: Any, path: str, max_cards: int) -> tuple[int, ...]:
+def _axis(value: Any, path: str, max_cards: int | None) -> tuple[int, ...]:
     if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
         raise InputValidationError(path, "must be a sequence")
     if not value:
@@ -38,7 +38,7 @@ def _axis(value: Any, path: str, max_cards: int) -> tuple[int, ...]:
             raise InputValidationError(item_path, "must be an integer")
         if item <= 0:
             raise InputValidationError(item_path, "must be positive")
-        if item > max_cards:
+        if max_cards is not None and item > max_cards:
             raise InputValidationError(
                 item_path, f"must not exceed max_cards ({max_cards})"
             )
@@ -76,7 +76,11 @@ class SearchSpace:
 
         defaults = _powers_of_two(max_cards)
         values = {
-            axis: _axis(data[axis], axis, max_cards)
+            axis: _axis(
+                data[axis],
+                axis,
+                None if axis == "batch_sizes" else max_cards,
+            )
             if axis in data else defaults
             for axis in _AXES
         }

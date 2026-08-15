@@ -349,6 +349,10 @@ class SearchSpaceTests(PathAssertions, unittest.TestCase):
         self.assertEqual(search.batch_sizes, (1, 8, 16))
         self.assertEqual(search.replicas, (1, 2, 4, 8, 16))
 
+    def test_explicit_batch_sizes_are_not_limited_by_max_cards(self):
+        search = SearchSpace.from_dict({"batch_sizes": [128]}, max_cards=64)
+        self.assertEqual(search.batch_sizes, (128,))
+
     def test_rejects_invalid_axis_values_with_exact_paths(self):
         cases = [
             ({"total_cards": []}, "total_cards"),
@@ -357,7 +361,7 @@ class SearchSpaceTests(PathAssertions, unittest.TestCase):
             ({"attention_dp": [-1]}, "attention_dp[0]"),
             ({"moe_tp": [True]}, "moe_tp[0]"),
             ({"expert_parallel": "1,2"}, "expert_parallel"),
-            ({"batch_sizes": [1, 9]}, "batch_sizes[1]"),
+            ({"total_cards": [1, 9]}, "total_cards[1]"),
         ]
         for config, path in cases:
             with self.subTest(path=path):
