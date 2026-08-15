@@ -318,18 +318,18 @@ class MlaAndMoeStageOperationTests(unittest.TestCase):
         gemms = by_name(ops.gemms)
         vectors = by_name(ops.vectors)
 
-        # Nine replica tokens become five local attention tokens. Routed
+        # Two local requests make six local attention tokens. Routed
         # assignments remain ceil(9 * 3 / 2) = 14 across four local experts.
-        self.assertEqual(gemms["attention.q_down_proj"].m, 5)
-        self.assertEqual(vectors["attention.rope"].elements, 5 * 3 * 2)
-        self.assertEqual(vectors["attention.softmax"].elements, 5 * 2 * 3)
-        self.assertEqual(vectors["norm.input"].elements, 5 * 16)
-        self.assertEqual(vectors["residual.ffn"].elements, 5 * 16)
-        self.assertEqual(vectors["moe.routing"].elements, 5 * 8)
+        self.assertEqual(gemms["attention.q_down_proj"].m, 6)
+        self.assertEqual(vectors["attention.rope"].elements, 6 * 3 * 2)
+        self.assertEqual(vectors["attention.softmax"].elements, 6 * 2 * 3)
+        self.assertEqual(vectors["norm.input"].elements, 6 * 16)
+        self.assertEqual(vectors["residual.ffn"].elements, 6 * 16)
+        self.assertEqual(vectors["moe.routing"].elements, 6 * 8)
         self.assertEqual(gemms["moe.routed_gate_proj"].m, 4)
         self.assertEqual(gemms["moe.routed_gate_proj"].repeats, 2)
         self.assertEqual(gemms["moe.routed_gate_proj"].batch_repeats, 4)
-        self.assertEqual(gemms["ffn.shared_gate_up"].m, 5)
+        self.assertEqual(gemms["ffn.shared_gate_up"].m, 6)
 
     def test_mla_prefill_uses_no_absorb_shapes(self):
         ops = stage_operations(

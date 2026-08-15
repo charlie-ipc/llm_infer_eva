@@ -667,7 +667,12 @@ def stage_operations(
     replica_tokens = (
         batch_size * input_length if stage == "prefill" else batch_size
     )
-    attention_tokens = _ceil_div(replica_tokens, plan.attention_dp)
+    local_requests = _ceil_div(batch_size, plan.attention_dp)
+    attention_tokens = (
+        local_requests * input_length
+        if stage == "prefill"
+        else local_requests
+    )
     gemms: list[GemmShape] = []
     vectors: list[VectorShape] = []
 

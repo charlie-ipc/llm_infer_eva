@@ -1,5 +1,5 @@
 import unittest
-from dataclasses import FrozenInstanceError, fields
+from dataclasses import FrozenInstanceError, fields, replace
 from math import ceil
 
 from infersim.cost import (
@@ -146,7 +146,7 @@ class PrefillEvaluatorTests(unittest.TestCase):
         precision = make_w4a4_precision()
         plan = make_dense_plan(attention_tp=2, moe_tp=2, batch_size=3)
         scenario = make_scenario(input_length=5)
-        local_tokens = ceil(3 * 5 / plan.attention_dp)
+        local_tokens = ceil(3 / plan.attention_dp) * 5
         payload = activation_payload_bytes(
             local_tokens * model.hidden_size, precision
         )
@@ -169,7 +169,7 @@ class PrefillEvaluatorTests(unittest.TestCase):
             batch_size=5,
         )
         scenario = make_scenario(input_length=3)
-        local_tokens = ceil(5 * 3 / 2)
+        local_tokens = ceil(5 / 2) * 3
         activation = activation_payload_bytes(
             local_tokens * model.hidden_size, precision
         )
@@ -192,9 +192,87 @@ class PrefillEvaluatorTests(unittest.TestCase):
         )
 
         result = evaluate_prefill(model, hardware, precision, plan, scenario)
+        operations = stage_operations(
+            model,
+            stage="prefill",
+            batch_size=plan.batch_size,
+            input_length=scenario.input_length,
+            average_context=scenario.input_length,
+            plan=plan,
+        )
 
+        self.assertEqual(operations.gemms[0].m, 9)
         self.assertEqual(result.tp_seconds, attention_tp + moe_tp)
         self.assertEqual(result.ep_seconds, ep)
+        self.assertEqual(
+            result.memory.activation_bytes_per_card,
+            2
+            * local_tokens
+            * model.hidden_size
+            * precision.activation_bits
+            / 8,
+        )
+
+    def test_moe_tp_separates_routed_and_shared_output_reductions(self):
+        model = make_mla_moe_model(
+            num_hidden_layers=2,
+            num_routed_experts=8,
+            num_experts_per_tok=3,
+        )
+        hardware = make_hardware()
+        precision = make_w4a8_precision()
+        plan = make_moe_plan(
+            attention_tp=1,
+            attention_dp=4,
+            moe_tp=2,
+            expert_parallel=2,
+            batch_size=3,
+        )
+        scenario = make_scenario(input_length=2)
+        local_attention_tokens = ceil(3 / 4) * 2
+        routed_assignments = ceil(3 * 2 * 3 / 2)
+        attention_payload = activation_payload_bytes(
+            local_attention_tokens * model.hidden_size, precision
+        )
+        routed_payload = activation_payload_bytes(
+            routed_assignments * model.hidden_size, precision
+        )
+        attention_seconds = (
+            model.num_full_attention_layers
+            * all_reduce_cost(attention_payload, 1, hardware).seconds
+        )
+        routed_seconds = (
+            model.num_hidden_layers
+            * all_reduce_cost(routed_payload, 2, hardware).seconds
+        )
+        shared_seconds = (
+            model.num_hidden_layers
+            * all_reduce_cost(attention_payload, 2, hardware).seconds
+        )
+
+        with_shared = evaluate_prefill(
+            model, hardware, precision, plan, scenario
+        )
+        without_shared = evaluate_prefill(
+            replace(
+                model,
+                num_shared_experts=0,
+                shared_expert_intermediate_size=0,
+            ),
+            hardware,
+            precision,
+            plan,
+            scenario,
+        )
+
+        self.assertEqual(
+            with_shared.tp_seconds,
+            attention_seconds + routed_seconds + shared_seconds,
+        )
+        self.assertEqual(
+            without_shared.tp_seconds,
+            attention_seconds + routed_seconds,
+        )
 
     def test_memory_infeasibility_is_reported_without_rejecting_metrics(self):
         result = evaluate_prefill(

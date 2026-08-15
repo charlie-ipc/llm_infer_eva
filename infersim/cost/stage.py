@@ -169,33 +169,73 @@ def evaluate_prefill(
         useful_vector_ops += cost.useful_ops * shape.repeats
         aligned_vector_ops += cost.aligned_ops * shape.repeats
 
-    local_tokens = (
-        plan.batch_size * scenario.input_length + plan.attention_dp - 1
+    replica_tokens = plan.batch_size * scenario.input_length
+    local_requests = (
+        plan.batch_size + plan.attention_dp - 1
     ) // plan.attention_dp
-    activation_payload = activation_payload_bytes(
-        local_tokens * model.hidden_size, precision
+    local_attention_tokens = local_requests * scenario.input_length
+    attention_payload = activation_payload_bytes(
+        local_attention_tokens * model.hidden_size, precision
     )
     attention_tp_seconds = _finite_product(
         all_reduce_cost(
-            activation_payload, plan.attention_tp, hardware
+            attention_payload, plan.attention_tp, hardware
         ).seconds,
         model.num_full_attention_layers,
         "latency_seconds",
     )
-    ffn_tp = plan.moe_tp if model.is_moe else plan.attention_tp
-    ffn_tp_seconds = _finite_product(
-        all_reduce_cost(activation_payload, ffn_tp, hardware).seconds,
-        model.num_hidden_layers,
-        "latency_seconds",
-    )
-    tp_seconds = _finite_sum(
-        (attention_tp_seconds, ffn_tp_seconds), "latency_seconds"
-    )
+    if model.is_moe:
+        routed_assignments = (
+            replica_tokens * model.experts_per_token
+            + plan.expert_parallel
+            - 1
+        ) // plan.expert_parallel
+        routed_payload = activation_payload_bytes(
+            routed_assignments * model.hidden_size, precision
+        )
+        routed_tp_seconds = _finite_product(
+            all_reduce_cost(
+                routed_payload, plan.moe_tp, hardware
+            ).seconds,
+            model.num_hidden_layers,
+            "latency_seconds",
+        )
+        shared_tp_seconds = 0.0
+        if model.num_shared_experts:
+            shared_tp_seconds = _finite_product(
+                all_reduce_cost(
+                    attention_payload, plan.moe_tp, hardware
+                ).seconds,
+                model.num_hidden_layers,
+                "latency_seconds",
+            )
+        tp_seconds = _finite_sum(
+            (
+                attention_tp_seconds,
+                routed_tp_seconds,
+                shared_tp_seconds,
+            ),
+            "latency_seconds",
+        )
+    else:
+        dense_ffn_tp_seconds = _finite_product(
+            all_reduce_cost(
+                attention_payload, plan.attention_tp, hardware
+            ).seconds,
+            model.num_hidden_layers,
+            "latency_seconds",
+        )
+        tp_seconds = _finite_sum(
+            (attention_tp_seconds, dense_ffn_tp_seconds),
+            "latency_seconds",
+        )
 
     ep_seconds = 0.0
     if model.is_moe and plan.expert_parallel > 1:
         expert_payload = activation_payload_bytes(
-            local_tokens * model.experts_per_token * model.hidden_size,
+            local_attention_tokens
+            * model.experts_per_token
+            * model.hidden_size,
             precision,
         )
         ep_seconds = _finite_product(
