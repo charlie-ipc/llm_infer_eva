@@ -217,6 +217,80 @@ class ModelSpecTests(unittest.TestCase):
                 "moe_intermediate_size": 1024,
             })
 
+    def test_rejects_single_routed_expert(self):
+        with self.assertRaisesRegex(InputValidationError, "num_routed_experts"):
+            ModelSpec.from_dict({
+                **dense_config(),
+                "num_routed_experts": 1,
+                "num_experts_per_tok": 1,
+                "moe_intermediate_size": 1024,
+            })
+
+    def test_rejects_moe_intermediate_size_on_dense_model(self):
+        with self.assertRaisesRegex(InputValidationError, "moe_intermediate_size"):
+            ModelSpec.from_dict(
+                dense_config(moe_intermediate_size=1024)
+            )
+
+    def test_rejects_positive_expert_selection_on_dense_model(self):
+        with self.assertRaisesRegex(
+            InputValidationError, "num_experts_per_token"
+        ):
+            ModelSpec.from_dict(
+                dense_config(num_experts_per_token=1)
+            )
+
+    def test_rejects_explicit_zero_expert_selection_on_dense_model(self):
+        with self.assertRaisesRegex(
+            InputValidationError, "num_experts_per_tok"
+        ):
+            ModelSpec.from_dict(
+                dense_config(num_experts_per_tok=0)
+            )
+
+    def test_rejects_explicit_zero_shared_experts(self):
+        with self.assertRaisesRegex(InputValidationError, "num_shared_experts"):
+            ModelSpec.from_dict({
+                **dense_config(),
+                "num_routed_experts": 8,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 1024,
+                "num_shared_experts": 0,
+            })
+
+    def test_rejects_negative_shared_expert_size(self):
+        with self.assertRaisesRegex(
+            InputValidationError, "shared_expert_intermediate_size"
+        ):
+            ModelSpec.from_dict({
+                **dense_config(),
+                "num_routed_experts": 8,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 1024,
+                "shared_expert_intermediate_size": -64,
+            })
+
+    def test_validates_shared_size_when_shared_count_is_also_invalid(self):
+        with self.assertRaisesRegex(
+            InputValidationError, "shared_expert_intermediate_size"
+        ):
+            ModelSpec.from_dict({
+                **dense_config(),
+                "num_routed_experts": 8,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 1024,
+                "num_shared_experts": 0,
+                "shared_expert_intermediate_size": -64,
+            })
+
+    def test_rejects_shared_experts_on_dense_model(self):
+        with self.assertRaisesRegex(InputValidationError, "num_shared_experts"):
+            ModelSpec.from_dict({
+                **dense_config(),
+                "num_shared_experts": 1,
+                "shared_expert_intermediate_size": 1024,
+            })
+
     def test_rejects_indivisible_shared_expert_size(self):
         with self.assertRaisesRegex(
             InputValidationError, "shared_expert_intermediate_size"

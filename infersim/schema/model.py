@@ -187,30 +187,49 @@ class ModelSpec:
         else:
             attention_kind = "gqa"
 
-        routed_field, routed_value = _aliased_value(
-            config, ("num_routed_experts", "num_experts"), 0
-        )
+        routed_fields = ("num_routed_experts", "num_experts")
+        routed_field, routed_value = _aliased_value(config, routed_fields, 0)
         num_routed_experts = _nonnegative_integer(
             routed_value, _field_path(prefix, routed_field)
         )
+        if num_routed_experts == 1:
+            raise InputValidationError(
+                _field_path(prefix, routed_field),
+                "must be zero for dense models or greater than one for MoE",
+            )
+
+        selected_fields = ("num_experts_per_tok", "num_experts_per_token")
+        selected_present = any(field in config for field in selected_fields)
         selected_field, selected_value = _aliased_value(
-            config, ("num_experts_per_tok", "num_experts_per_token"), 0
+            config, selected_fields, 0
         )
         experts_per_token = _nonnegative_integer(
             selected_value, _field_path(prefix, selected_field)
         )
-        if experts_per_token > num_routed_experts:
+        is_moe = num_routed_experts > 1
+        if is_moe:
+            if experts_per_token == 0:
+                raise InputValidationError(
+                    _field_path(prefix, selected_field),
+                    "must be positive when routed experts are configured",
+                )
+            if experts_per_token > num_routed_experts:
+                raise InputValidationError(
+                    _field_path(prefix, selected_field),
+                    "must not exceed num_routed_experts",
+                )
+        elif selected_present:
             raise InputValidationError(
                 _field_path(prefix, selected_field),
-                "must not exceed num_routed_experts",
-            )
-        if num_routed_experts > 0 and experts_per_token == 0:
-            raise InputValidationError(
-                _field_path(prefix, selected_field),
-                "must be positive when routed experts are configured",
+                "is only valid for MoE models",
             )
 
-        if num_routed_experts > 0 and "moe_intermediate_size" in config:
+        if not is_moe and "moe_intermediate_size" in config:
+            raise InputValidationError(
+                _field_path(prefix, "moe_intermediate_size"),
+                "is only valid for MoE models",
+            )
+        if is_moe and "moe_intermediate_size" in config:
             intermediate_field = "moe_intermediate_size"
         else:
             intermediate_field = "intermediate_size"
@@ -218,24 +237,38 @@ class ModelSpec:
             config, intermediate_field, prefix
         )
 
-        if "num_shared_experts" in config:
-            num_shared_experts = _nonnegative_integer(
+        shared_count_present = "num_shared_experts" in config
+        shared_size_present = "shared_expert_intermediate_size" in config
+        total_shared_size = None
+        if shared_size_present:
+            total_shared_size = _positive_integer(
+                config["shared_expert_intermediate_size"],
+                _field_path(prefix, "shared_expert_intermediate_size"),
+            )
+
+        if shared_count_present:
+            num_shared_experts = _positive_integer(
                 config["num_shared_experts"],
                 _field_path(prefix, "num_shared_experts"),
             )
-        elif "shared_expert_intermediate_size" in config:
+        elif shared_size_present:
             num_shared_experts = 1
         else:
             num_shared_experts = 0
 
         if num_shared_experts:
-            total_shared_size = _positive_integer(
-                config.get(
-                    "shared_expert_intermediate_size",
-                    num_shared_experts * intermediate_size,
-                ),
-                _field_path(prefix, "shared_expert_intermediate_size"),
-            )
+            if not is_moe:
+                shared_path = (
+                    "num_shared_experts"
+                    if shared_count_present
+                    else "shared_expert_intermediate_size"
+                )
+                raise InputValidationError(
+                    _field_path(prefix, shared_path),
+                    "shared experts are only valid for MoE models",
+                )
+            if total_shared_size is None:
+                total_shared_size = num_shared_experts * intermediate_size
             if total_shared_size % num_shared_experts != 0:
                 raise InputValidationError(
                     _field_path(prefix, "shared_expert_intermediate_size"),
