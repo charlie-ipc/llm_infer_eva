@@ -549,6 +549,41 @@ class HybridStageOperationTests(unittest.TestCase):
         self.assertEqual(vectors["norm.input"].repeats, 3)
         self.assertEqual(vectors["residual.ffn"].repeats, 3)
 
+    def test_linear_attention_heads_are_sharded_across_attention_tp(self):
+        model = make_hybrid_model(
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            linear_num_key_heads=4,
+            linear_num_value_heads=4,
+        )
+        tp1 = stage_operations(
+            model,
+            stage="decode",
+            batch_size=2,
+            input_length=3,
+            average_context=9,
+            plan=make_dense_plan(),
+        )
+        tp2 = stage_operations(
+            model,
+            stage="decode",
+            batch_size=2,
+            input_length=3,
+            average_context=9,
+            plan=make_dense_plan(attention_tp=2, moe_tp=2),
+        )
+        tp1_gemms = by_name(tp1.gemms)
+        tp2_gemms = by_name(tp2.gemms)
+        tp1_vectors = by_name(tp1.vectors)
+        tp2_vectors = by_name(tp2.vectors)
+
+        self.assertEqual(tp1_gemms["linear_attention.qkvzba_proj"].n, 48)
+        self.assertEqual(tp2_gemms["linear_attention.qkvzba_proj"].n, 24)
+        self.assertEqual(tp1_gemms["linear_attention.o_proj"].k, 12)
+        self.assertEqual(tp2_gemms["linear_attention.o_proj"].k, 6)
+        self.assertEqual(tp1_vectors["linear_attention.core"].elements, 80)
+        self.assertEqual(tp2_vectors["linear_attention.core"].elements, 40)
+
 
 class StageValidationTests(unittest.TestCase):
     def test_rejects_invalid_stage_dimensions_context_and_plan(self):

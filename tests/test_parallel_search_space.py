@@ -7,6 +7,7 @@ from infersim.schema.parallel import (
     SearchSpace,
 )
 from infersim.search import enumerate_plans, validate_plan
+from tests.helpers import make_hybrid_model
 
 
 def dense_model(**overrides):
@@ -136,6 +137,59 @@ class PlanValidationTests(unittest.TestCase):
             "KV_HEADS_NOT_DIVISIBLE",
         )
 
+    def test_linear_attention_key_heads_must_divide_attention_tp(self):
+        plan = ParallelPlan(1, 2, 1, 2, 1, 8)
+
+        result = validate_plan(
+            make_hybrid_model(
+                num_attention_heads=4,
+                num_key_value_heads=4,
+                linear_num_key_heads=3,
+                linear_num_value_heads=4,
+            ),
+            plan,
+        )
+
+        self.assertEqual(result.reason_code, "LINEAR_KEY_HEADS_NOT_DIVISIBLE")
+        self.assertEqual(
+            result.reason,
+            "linear attention key heads must be divisible by attention_tp",
+        )
+
+    def test_linear_attention_value_heads_follow_key_heads_in_priority(self):
+        plan = ParallelPlan(1, 2, 1, 2, 1, 8)
+
+        result = validate_plan(
+            make_hybrid_model(
+                num_attention_heads=4,
+                num_key_value_heads=4,
+                linear_num_key_heads=4,
+                linear_num_value_heads=3,
+            ),
+            plan,
+        )
+
+        self.assertEqual(
+            result.reason_code, "LINEAR_VALUE_HEADS_NOT_DIVISIBLE"
+        )
+        self.assertEqual(
+            result.reason,
+            "linear attention value heads must be divisible by attention_tp",
+        )
+
+    def test_linear_head_dimensions_are_not_tensor_parallel_axes(self):
+        plan = ParallelPlan(1, 2, 1, 2, 1, 8)
+        model = make_hybrid_model(
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            linear_num_key_heads=4,
+            linear_key_head_dim=3,
+            linear_num_value_heads=4,
+            linear_value_head_dim=5,
+        )
+
+        self.assertTrue(validate_plan(model, plan).feasible)
+
     def test_mla_skips_kv_head_divisibility(self):
         model = moe_model(
             num_key_value_heads=3,
@@ -170,6 +224,18 @@ class PlanValidationTests(unittest.TestCase):
             moe_model(num_routed_experts=8),
             plan,
             "EXPERTS_NOT_DIVISIBLE",
+        )
+
+    def test_shared_intermediate_divisibility_precedes_expert_count(self):
+        plan = ParallelPlan(1, 2, 2, 2, 2, 8)
+        self.assert_reason(
+            moe_model(
+                num_routed_experts=3,
+                num_shared_experts=1,
+                shared_expert_intermediate_size=5,
+            ),
+            plan,
+            "SHARED_INTERMEDIATE_NOT_DIVISIBLE",
         )
 
 
@@ -250,6 +316,40 @@ class EnumerationTests(unittest.TestCase):
 
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].reason_code, "NONPOSITIVE_PARALLELISM")
+
+    def test_hybrid_enumeration_keeps_valid_and_invalid_linear_tp_plans(self):
+        model = make_hybrid_model(
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            linear_num_key_heads=3,
+            linear_num_value_heads=4,
+        )
+        search_space = SearchSpace(
+            total_cards=(1, 2),
+            replicas=(1,),
+            attention_tp=(1, 2),
+            attention_dp=(1,),
+            moe_tp=(1, 2),
+            expert_parallel=(1,),
+            batch_sizes=(2,),
+        )
+
+        results = list(enumerate_plans(model, search_space))
+
+        self.assertTrue(
+            any(
+                item.feasible and item.plan.attention_tp == 1
+                for item in results
+            )
+        )
+        self.assertTrue(
+            any(
+                item.reason_code == "LINEAR_KEY_HEADS_NOT_DIVISIBLE"
+                and item.plan.attention_tp == 2
+                and item.plan.moe_tp == 2
+                for item in results
+            )
+        )
 
 
 if __name__ == "__main__":

@@ -464,16 +464,18 @@ def _mla_operations(
 
 
 def _linear_attention_operations(
-    model: ModelSpec, m: int
+    model: ModelSpec, plan: ParallelPlan, m: int
 ) -> tuple[list[GemmShape], list[VectorShape]]:
     if not model.num_linear_attention_layers:
         return [], []
-    key_dim = model.linear_num_key_heads * model.linear_key_head_dim
-    value_dim = (
-        model.linear_num_value_heads * model.linear_value_head_dim
+    local_key_heads = model.linear_num_key_heads // plan.attention_tp
+    local_value_heads = model.linear_num_value_heads // plan.attention_tp
+    local_key_dim = local_key_heads * model.linear_key_head_dim
+    local_value_dim = (
+        local_value_heads * model.linear_value_head_dim
     )
     output_width = (
-        2 * key_dim + 2 * value_dim + 2 * model.linear_num_value_heads
+        2 * local_key_dim + 2 * local_value_dim + 2 * local_value_heads
     )
     repeats = model.num_linear_attention_layers
     return (
@@ -488,7 +490,7 @@ def _linear_attention_operations(
             GemmShape(
                 "linear_attention.o_proj",
                 m,
-                value_dim,
+                local_value_dim,
                 model.hidden_size,
                 repeats,
             ),
@@ -496,7 +498,7 @@ def _linear_attention_operations(
         [
             VectorShape(
                 "linear_attention.core",
-                m * (2 * key_dim + 2 * value_dim),
+                m * (2 * local_key_dim + 2 * local_value_dim),
                 6,
                 repeats,
             )
@@ -689,7 +691,7 @@ def stage_operations(
         vectors.extend(attention_vectors)
 
     linear_gemms, linear_vectors = _linear_attention_operations(
-        model, attention_tokens
+        model, plan, attention_tokens
     )
     gemms.extend(linear_gemms)
     vectors.extend(linear_vectors)

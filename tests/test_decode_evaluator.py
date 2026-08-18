@@ -214,10 +214,15 @@ class DecodeEvaluatorTests(unittest.TestCase):
         self.assertEqual(result.gemm_seconds, expected_seconds)
 
     def test_hybrid_recurrent_state_is_read_once_per_linear_layer(self):
-        model = make_hybrid_model()
+        model = make_hybrid_model(
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            linear_num_key_heads=4,
+            linear_num_value_heads=4,
+        )
         hardware = make_memory_bound_hardware()
         precision = make_w4a8_precision()
-        plan = make_dense_plan(batch_size=3)
+        plan = make_dense_plan(attention_tp=2, moe_tp=2, batch_size=3)
         scenario = make_scenario(input_length=64, output_length=16)
         operations = stage_operations(
             model,
@@ -231,6 +236,7 @@ class DecodeEvaluatorTests(unittest.TestCase):
             recurrent_state_bytes_per_request(model)
             / model.num_linear_attention_layers
             * plan.batch_size
+            / plan.attention_tp
         )
         mode = vector_mode_for_bits(precision.vector_bits)
         expected_seconds = 0.0
@@ -254,6 +260,10 @@ class DecodeEvaluatorTests(unittest.TestCase):
         result = evaluate_decode(model, hardware, precision, plan, scenario)
 
         self.assertEqual(result.vector_seconds, expected_seconds)
+        self.assertEqual(
+            result.memory.recurrent_state_bytes_per_card,
+            recurrent_state_bytes_per_request(model) * plan.batch_size,
+        )
 
     def test_max_batch_uses_full_context_variable_memory_and_reports_oom_zero(self):
         model = make_dense_model(

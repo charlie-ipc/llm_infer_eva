@@ -19,6 +19,7 @@ from tests.helpers import (
     make_dense_model,
     make_dense_plan,
     make_hardware,
+    make_hybrid_model,
     make_mla_moe_model,
     make_moe_plan,
     make_scenario,
@@ -158,6 +159,42 @@ class PrefillEvaluatorTests(unittest.TestCase):
 
         self.assertEqual(result.tp_seconds, 6 * one)
         self.assertEqual(result.ep_seconds, 0.0)
+
+    def test_hybrid_tp_reduces_full_and_linear_attention_outputs(self):
+        model = make_hybrid_model(
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            linear_num_key_heads=4,
+            linear_num_value_heads=4,
+        )
+        hardware = make_hardware()
+        precision = make_w4a4_precision()
+        scenario = make_scenario(input_length=5)
+        tp1 = evaluate_prefill(
+            model,
+            hardware,
+            precision,
+            make_dense_plan(batch_size=3),
+            scenario,
+        )
+        tp2_plan = make_dense_plan(
+            attention_tp=2, moe_tp=2, batch_size=3
+        )
+        local_tokens = ceil(3 / tp2_plan.attention_dp) * 5
+        payload = activation_payload_bytes(
+            local_tokens * model.hidden_size, precision
+        )
+        one = all_reduce_cost(payload, 2, hardware).seconds
+
+        tp2 = evaluate_prefill(
+            model, hardware, precision, tp2_plan, scenario
+        )
+
+        self.assertEqual(tp1.tp_seconds, 0.0)
+        self.assertEqual(
+            tp2.tp_seconds,
+            (model.num_hidden_layers + model.num_hidden_layers) * one,
+        )
 
     def test_moe_uses_distinct_attention_tp_moe_tp_and_two_ep_exchanges(self):
         model = make_mla_moe_model(num_hidden_layers=2)

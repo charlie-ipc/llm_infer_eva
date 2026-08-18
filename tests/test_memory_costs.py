@@ -71,14 +71,19 @@ class MemoryCostTests(unittest.TestCase):
         self.assertEqual(result.dense_ffn_weight_bytes, counts.dense_ffn_weight_elements / 2 / 2)
 
     def test_linear_attention_weights_follow_attention_tp(self):
-        model = make_hybrid_model()
+        model = make_hybrid_model(
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            linear_num_key_heads=4,
+            linear_num_value_heads=4,
+        )
         counts = model_counts(model)
         result = breakdown(
             model,
-            plan=make_dense_plan(attention_tp=3, moe_tp=3),
+            plan=make_dense_plan(attention_tp=2, moe_tp=2),
         )
 
-        self.assertEqual(result.linear_attention_weight_bytes, counts.linear_attention_weight_elements / 2 / 3)
+        self.assertEqual(result.linear_attention_weight_bytes, counts.linear_attention_weight_elements / 2 / 2)
 
     def test_moe_weight_components_use_their_distinct_placement_rules(self):
         model = make_mla_moe_model()

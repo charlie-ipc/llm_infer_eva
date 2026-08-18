@@ -204,7 +204,7 @@ def _kernel_totals(
             state_read_bytes = _finite_divide(
                 recurrent_state_bytes_per_request(decode_model)
                 * local_requests,
-                decode_model.num_linear_attention_layers,
+                decode_model.num_linear_attention_layers * attention_tp,
                 path,
             )
             memory_bytes = _finite_sum(
@@ -255,7 +255,8 @@ def _communication_seconds(
         all_reduce_cost(
             attention_payload, plan.attention_tp, hardware
         ).seconds,
-        model.num_full_attention_layers,
+        model.num_full_attention_layers
+        + model.num_linear_attention_layers,
         "latency_seconds",
     )
     if model.is_moe:

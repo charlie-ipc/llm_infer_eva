@@ -84,12 +84,43 @@ def validate_plan(
             "key-value heads must be divisible by attention_tp",
         )
 
+    if (
+        model.num_linear_attention_layers > 0
+        and model.linear_num_key_heads % plan.attention_tp != 0
+    ):
+        return _invalid(
+            plan,
+            "LINEAR_KEY_HEADS_NOT_DIVISIBLE",
+            "linear attention key heads must be divisible by attention_tp",
+        )
+
+    if (
+        model.num_linear_attention_layers > 0
+        and model.linear_num_value_heads % plan.attention_tp != 0
+    ):
+        return _invalid(
+            plan,
+            "LINEAR_VALUE_HEADS_NOT_DIVISIBLE",
+            "linear attention value heads must be divisible by attention_tp",
+        )
+
     ffn_tp = plan.moe_tp if model.is_moe else plan.attention_tp
     if model.intermediate_size % ffn_tp != 0:
         return _invalid(
             plan,
             "INTERMEDIATE_NOT_DIVISIBLE",
             "intermediate size must be divisible by its tensor parallel width",
+        )
+
+    if (
+        model.is_moe
+        and model.num_shared_experts
+        and model.shared_expert_intermediate_size % plan.moe_tp != 0
+    ):
+        return _invalid(
+            plan,
+            "SHARED_INTERMEDIATE_NOT_DIVISIBLE",
+            "shared expert intermediate size must be divisible by moe_tp",
         )
 
     if model.is_moe and model.num_routed_experts % plan.expert_parallel != 0:

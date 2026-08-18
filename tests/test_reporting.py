@@ -28,6 +28,8 @@ from tests.helpers import (
     make_dense_model,
     make_dense_plan,
     make_hardware,
+    make_mla_moe_model,
+    make_moe_plan,
     make_metrics,
     make_scenario,
     make_scenario_set,
@@ -362,6 +364,62 @@ class RunnerTests(unittest.TestCase):
                     "dense mismatch",
                 ),
             ),
+        )
+
+    def test_shared_expert_invalid_plan_does_not_abort_valid_plan_search(self):
+        model = make_mla_moe_model(
+            num_shared_experts=1,
+            shared_expert_intermediate_size=5,
+        )
+        search_space = SearchSpace(
+            total_cards=(1, 2),
+            replicas=(1,),
+            attention_tp=(1, 2),
+            attention_dp=(1,),
+            moe_tp=(1, 2),
+            expert_parallel=(1,),
+            batch_sizes=(2,),
+        )
+        inputs = self.inputs()
+        inputs["model"] = model
+        inputs["search_space"] = search_space
+
+        result = run_stage_search(**inputs)
+
+        invalid = next(
+            candidate
+            for candidate in result.candidates
+            if candidate.plan == make_moe_plan(
+                attention_tp=2,
+                attention_dp=1,
+                moe_tp=2,
+                expert_parallel=1,
+            )
+            and candidate.reason_codes
+            == ("SHARED_INTERMEDIATE_NOT_DIVISIBLE",)
+        )
+        valid = next(
+            candidate
+            for candidate in result.candidates
+            if candidate.plan == make_moe_plan(
+                attention_tp=1,
+                attention_dp=1,
+                moe_tp=1,
+                expert_parallel=1,
+            )
+            and candidate.metrics
+        )
+        diagnostic = next(
+            item
+            for item in result.diagnostics
+            if item.candidate_id == invalid.candidate_id
+        )
+
+        self.assertEqual(invalid.metrics, ())
+        self.assertTrue(valid.metrics)
+        self.assertEqual(
+            diagnostic.detail,
+            "shared expert intermediate size must be divisible by moe_tp",
         )
 
     def test_runner_preserves_normalized_context_and_assumptions(self):
