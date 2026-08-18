@@ -66,6 +66,7 @@ PD_CSV_FIELDS = (
     "tpot_ms",
     "bottleneck",
     "scenario_count",
+    "minimum_link_request_capacity",
     "transfer_summary",
 )
 
@@ -687,6 +688,7 @@ def _pd_transfer_summary(candidate: PDCandidate) -> str:
             f"{metric.scenario_name}:payload_bytes={transfer.payload_bytes:.6f},"
             f"effective_bw_Bps={transfer.effective_bandwidth_bytes_per_second:.6f},"
             f"transfer_seconds={transfer.transfer_seconds:.12f},"
+            f"link_request_capacity={transfer.link_request_capacity:.6f},"
             f"concurrency={transfer.concurrent_transfers_required},"
             f"feasible={'true' if transfer.concurrency_feasible else 'false'}"
         )
@@ -716,6 +718,13 @@ def _pd_candidate_row(candidate: PDCandidate) -> dict:
         "tpot_ms": _six(candidate.tpot_ms, "tpot_ms"),
         "bottleneck": ";".join(bottlenecks),
         "scenario_count": len(candidate.metrics),
+        "minimum_link_request_capacity": _six(
+            min(
+                metric.transfer.link_request_capacity
+                for metric in candidate.metrics
+            ),
+            "minimum_link_request_capacity",
+        ),
         "transfer_summary": _pd_transfer_summary(candidate),
     }
 
@@ -761,11 +770,41 @@ def _pd_summary(result: PDSearchResult) -> str:
 
 
 def _pd_report_contents(result: PDSearchResult) -> dict[str, str]:
+    prefill_context = result.prefill_context
+    decode_context = result.decode_context
     payload = {
         "assumptions": list(_PD_ASSUMPTIONS),
         "dominant_rejection": result.dominant_rejection,
         "normalized_input_summary": {
+            "decode_hardware": None
+            if decode_context is None
+            else _normalized_value(
+                decode_context.hardware, "decode_context.hardware"
+            ),
+            "decode_search_space": None
+            if decode_context is None
+            else _normalized_value(
+                decode_context.search_space, "decode_context.search_space"
+            ),
+            "model": None
+            if prefill_context is None
+            else _normalized_value(prefill_context.model, "context.model"),
             "pd_link": _normalized_value(result.pd_link, "pd_link"),
+            "precision": None
+            if prefill_context is None
+            else _normalized_value(
+                prefill_context.precision, "context.precision"
+            ),
+            "prefill_hardware": None
+            if prefill_context is None
+            else _normalized_value(
+                prefill_context.hardware, "prefill_context.hardware"
+            ),
+            "prefill_search_space": None
+            if prefill_context is None
+            else _normalized_value(
+                prefill_context.search_space, "prefill_context.search_space"
+            ),
             "scenario_set": _normalized_value(
                 result.scenario_set, "scenario_set"
             ),

@@ -1,9 +1,16 @@
+import csv
+from contextlib import redirect_stderr, redirect_stdout
+import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
+
+import infersim.cli as cli
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -81,6 +88,56 @@ def search_arguments(stage, output):
     )
 
 
+def without_option(arguments, option):
+    values = list(arguments)
+    index = values.index(option)
+    del values[index : index + 2]
+    return tuple(values)
+
+
+def pair_arguments(output):
+    return (
+        "pair-pd",
+        "--model",
+        MODEL,
+        "--prefill-hardware",
+        EXAMPLES / "custom_npu.json",
+        "--decode-hardware",
+        EXAMPLES / "custom_npu.json",
+        "--pd-link",
+        EXAMPLES / "pd_link.json",
+        "--precision",
+        EXAMPLES / "w4a8.json",
+        "--scenarios",
+        EXAMPLES / "scenarios.json",
+        "--prefill-search-space",
+        EXAMPLES / "search_space.json",
+        "--decode-search-space",
+        EXAMPLES / "search_space.json",
+        "--output",
+        output,
+    )
+
+
+def tree_snapshot(root):
+    return tuple(
+        (
+            "directory" if path.is_dir() else "file",
+            path.relative_to(root).as_posix(),
+            None if path.is_dir() else path.read_bytes(),
+        )
+        for path in sorted(root.rglob("*"))
+    )
+
+
+def run_main(*arguments):
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with redirect_stdout(stdout), redirect_stderr(stderr):
+        code = cli.main(list(map(str, arguments)))
+    return code, stdout.getvalue(), stderr.getvalue()
+
+
 class SearchCliTests(unittest.TestCase):
     def test_prefill_and_decode_write_deterministic_reports(self):
         with tempfile.TemporaryDirectory(prefix="infersim cli ") as temporary:
@@ -110,27 +167,7 @@ class SearchCliTests(unittest.TestCase):
     def test_pair_pd_writes_three_report_directories(self):
         with tempfile.TemporaryDirectory(prefix="infersim pair ") as temporary:
             output = Path(temporary) / "pd output with spaces"
-            command = (
-                "pair-pd",
-                "--model",
-                MODEL,
-                "--prefill-hardware",
-                EXAMPLES / "custom_npu.json",
-                "--decode-hardware",
-                EXAMPLES / "custom_npu.json",
-                "--pd-link",
-                EXAMPLES / "pd_link.json",
-                "--precision",
-                EXAMPLES / "w4a8.json",
-                "--scenarios",
-                EXAMPLES / "scenarios.json",
-                "--prefill-search-space",
-                EXAMPLES / "search_space.json",
-                "--decode-search-space",
-                EXAMPLES / "search_space.json",
-                "--output",
-                output,
-            )
+            command = pair_arguments(output)
             result = run_cli(*command)
 
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -153,9 +190,41 @@ class SearchCliTests(unittest.TestCase):
                 (output / "pd" / "recommendation.json").read_text(encoding="utf-8")
             )
             self.assertIsNotNone(recommendation["recommendation"])
+            inputs = recommendation["normalized_input_summary"]
+            self.assertEqual(
+                set(inputs),
+                {
+                    "model",
+                    "precision",
+                    "prefill_hardware",
+                    "decode_hardware",
+                    "prefill_search_space",
+                    "decode_search_space",
+                    "scenario_set",
+                    "pd_link",
+                },
+            )
+            self.assertEqual(inputs["model"]["model_type"], "qwen3")
+            self.assertEqual(inputs["precision"]["gemm_mode"], "w4a8")
+            self.assertEqual(
+                inputs["prefill_hardware"]["name"], "Example 128GB NPU"
+            )
+            self.assertEqual(
+                inputs["decode_hardware"]["name"], "Example 128GB NPU"
+            )
             metric = recommendation["recommendation"]["scenarios"][0]
             self.assertIsInstance(metric["payload_bytes"], float)
             self.assertIn("effective_bandwidth_bytes_per_second", metric["transfer"])
+            with (output / "pd" / "all_pairs.csv").open(
+                encoding="utf-8", newline=""
+            ) as handle:
+                pair_row = next(csv.DictReader(handle))
+            self.assertIn("minimum_link_request_capacity", pair_row)
+            self.assertEqual(
+                pair_row["minimum_link_request_capacity"],
+                f'{metric["transfer"]["link_request_capacity"]:.6f}',
+            )
+            self.assertIn("link_request_capacity=", pair_row["transfer_summary"])
 
             second_output = Path(temporary) / "second pd output"
             second_command = list(command)
@@ -217,6 +286,91 @@ class SearchCliTests(unittest.TestCase):
             self.assertEqual(missing_result.stdout, "")
             self.assertIn(str(missing_path), missing_result.stderr)
             self.assertIn("cannot read file", missing_result.stderr)
+
+    def test_invalid_utf8_and_duplicate_keys_are_input_errors(self):
+        with tempfile.TemporaryDirectory(prefix="infersim strict json ") as temporary:
+            root = Path(temporary)
+            cases = []
+
+            invalid_utf8 = root / "invalid utf8.json"
+            invalid_utf8.write_bytes(b"\xff")
+            cases.append((invalid_utf8, "invalid UTF-8"))
+
+            hardware = json.dumps(hardware_fixture())
+            top_duplicate = root / "top duplicate.json"
+            top_duplicate.write_text(
+                '{"name":"duplicate",' + hardware[1:], encoding="utf-8"
+            )
+            cases.append((top_duplicate, "duplicate key 'name'"))
+
+            nested_duplicate = root / "nested duplicate.json"
+            nested_duplicate.write_text(
+                hardware.replace(
+                    '"compute_tflops": {',
+                    '"compute_tflops": {"gemm":{"w4a8":1},',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            cases.append((nested_duplicate, "duplicate key 'gemm'"))
+
+            for path, message in cases:
+                with self.subTest(path=path.name):
+                    args = list(
+                        search_arguments("prefill", root / (path.stem + " output"))
+                    )
+                    args[args.index("--hardware") + 1] = path
+                    result = run_cli(*args)
+
+                    self.assertEqual(result.returncode, 2)
+                    self.assertEqual(result.stdout, "")
+                    self.assertIn(str(path), result.stderr)
+                    self.assertIn(message, result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+
+    def test_default_search_space_is_bounded_and_pair_pd_completes(self):
+        with tempfile.TemporaryDirectory(prefix="infersim defaults ") as temporary:
+            root = Path(temporary)
+            search_output = root / "search"
+            search_result = run_cli(
+                *without_option(
+                    search_arguments("prefill", search_output),
+                    "--search-space",
+                )
+            )
+
+            self.assertEqual(search_result.returncode, 0, search_result.stderr)
+            with (search_output / "all_candidates.csv").open(
+                encoding="utf-8", newline=""
+            ) as handle:
+                candidates = list(csv.DictReader(handle))
+            self.assertEqual(len(candidates), 864)
+            self.assertLessEqual(len(candidates), 1000)
+
+            pair_output = root / "pair"
+            pair_result = run_cli(
+                "pair-pd",
+                "--model",
+                MODEL,
+                "--prefill-hardware",
+                EXAMPLES / "custom_npu.json",
+                "--decode-hardware",
+                EXAMPLES / "custom_npu.json",
+                "--pd-link",
+                EXAMPLES / "pd_link.json",
+                "--precision",
+                EXAMPLES / "w4a8.json",
+                "--scenarios",
+                EXAMPLES / "scenarios.json",
+                "--output",
+                pair_output,
+            )
+            self.assertEqual(pair_result.returncode, 0, pair_result.stderr)
+            for stage in ("prefill", "decode"):
+                with (pair_output / stage / "all_candidates.csv").open(
+                    encoding="utf-8", newline=""
+                ) as handle:
+                    self.assertEqual(sum(1 for _ in csv.DictReader(handle)), 864)
 
     def test_no_feasible_plan_still_writes_all_stage_reports(self):
         with tempfile.TemporaryDirectory(prefix="infersim infeasible ") as temporary:
@@ -292,6 +446,141 @@ class SearchCliTests(unittest.TestCase):
                 )
             )
             self.assertIsNone(pd_payload["recommendation"])
+
+    def test_pair_pd_rejects_a_non_directory_output_without_modifying_it(self):
+        with tempfile.TemporaryDirectory(prefix="infersim output file ") as temporary:
+            output = Path(temporary) / "existing result"
+            output.write_bytes(b"owned by caller")
+
+            result = run_cli(*pair_arguments(output))
+
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.stdout, "")
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertIn(str(output), result.stderr)
+            self.assertIn("must be a directory", result.stderr)
+            self.assertEqual(output.read_bytes(), b"owned by caller")
+
+    def test_search_output_io_error_is_reported_without_a_traceback(self):
+        with tempfile.TemporaryDirectory(prefix="infersim search output ") as temporary:
+            output = Path(temporary) / "existing result"
+            output.write_bytes(b"owned by caller")
+
+            result = run_cli(*search_arguments("prefill", output))
+
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.stdout, "")
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertIn(str(output), result.stderr)
+            self.assertEqual(output.read_bytes(), b"owned by caller")
+
+    def test_pair_pd_report_failures_preserve_the_old_result_tree(self):
+        with tempfile.TemporaryDirectory(prefix="infersim report rollback ") as temporary:
+            parent = Path(temporary)
+            real_stage_writer = cli.write_stage_reports
+
+            def fail_second_stage():
+                calls = 0
+
+                def writer(*args):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 2:
+                        raise OSError("injected second stage failure")
+                    return real_stage_writer(*args)
+
+                return patch("infersim.cli.write_stage_reports", side_effect=writer)
+
+            failures = (
+                fail_second_stage,
+                lambda: patch(
+                    "infersim.cli.write_pd_reports",
+                    side_effect=OSError("injected PD report failure"),
+                ),
+            )
+            for index, failure in enumerate(failures):
+                with self.subTest(failure=failure):
+                    output = parent / f"results-{index}"
+                    output.mkdir()
+                    (output / "old.txt").write_bytes(b"old root")
+                    (output / "nested").mkdir()
+                    (output / "nested" / "old.bin").write_bytes(b"old nested")
+                    before = tree_snapshot(output)
+
+                    with failure():
+                        code, stdout, stderr = run_main(*pair_arguments(output))
+
+                    self.assertEqual(code, 2)
+                    self.assertEqual(stdout, "")
+                    self.assertIn("error:", stderr)
+                    self.assertEqual(tree_snapshot(output), before)
+                    self.assertEqual(
+                        {path.name for path in parent.iterdir()},
+                        {f"results-{value}" for value in range(index + 1)},
+                    )
+
+    def test_pair_pd_publish_failure_restores_old_tree_and_cleans_staging(self):
+        with tempfile.TemporaryDirectory(prefix="infersim publish rollback ") as temporary:
+            parent = Path(temporary)
+            output = parent / "results"
+            output.mkdir()
+            (output / "old.txt").write_bytes(b"old")
+            before = tree_snapshot(output)
+            real_replace = os.replace
+            calls = 0
+
+            def fail_second_replace(source, destination):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("injected publish failure")
+                return real_replace(source, destination)
+
+            with patch("infersim.cli.os.replace", side_effect=fail_second_replace):
+                code, stdout, stderr = run_main(*pair_arguments(output))
+
+            self.assertEqual(code, 2)
+            self.assertEqual(stdout, "")
+            self.assertIn("injected publish failure", stderr)
+            self.assertEqual(tree_snapshot(output), before)
+            self.assertEqual({path.name for path in parent.iterdir()}, {"results"})
+
+    def test_pair_pd_success_replaces_the_owned_result_root_as_one_generation(self):
+        with tempfile.TemporaryDirectory(prefix="infersim publish success ") as temporary:
+            parent = Path(temporary)
+            output = parent / "results"
+            output.mkdir()
+            (output / "old.txt").write_bytes(b"old generation")
+
+            result = run_cli(*pair_arguments(output))
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                {path.name for path in output.iterdir()},
+                {"prefill", "decode", "pd"},
+            )
+            self.assertFalse((output / "old.txt").exists())
+            self.assertEqual({path.name for path in parent.iterdir()}, {"results"})
+
+    def test_pair_pd_does_not_swallow_programming_errors(self):
+        with tempfile.TemporaryDirectory(prefix="infersim programming error ") as temporary:
+            parent = Path(temporary)
+            output = parent / "results"
+            output.mkdir()
+            (output / "old.txt").write_bytes(b"old")
+            before = tree_snapshot(output)
+
+            with patch(
+                "infersim.cli.write_pd_reports",
+                side_effect=RuntimeError("injected programming error"),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "injected programming error"
+                ):
+                    run_main(*pair_arguments(output))
+
+            self.assertEqual(tree_snapshot(output), before)
+            self.assertEqual({path.name for path in parent.iterdir()}, {"results"})
 
 
 if __name__ == "__main__":

@@ -14,7 +14,7 @@ from infersim.cost.pd import (
 from infersim.errors import InputValidationError
 from infersim.schema.scenario import PDLinkSpec, ScenarioSet, WorkloadScenario
 from infersim.search.constraints import StageCandidate
-from infersim.search.runner import SearchResult
+from infersim.search.runner import SearchContext, SearchResult
 
 
 _WEIGHTED_SOFT_CODES = {
@@ -377,6 +377,8 @@ class PDSearchResult:
     dominant_rejection: str | None
     scenario_set: ScenarioSet
     pd_link: PDLinkSpec
+    prefill_context: SearchContext | None = None
+    decode_context: SearchContext | None = None
 
     def __post_init__(self) -> None:
         candidates = _candidate_tuple(self.candidates, "candidates")
@@ -427,6 +429,23 @@ class PDSearchResult:
             )
         if not isinstance(self.pd_link, PDLinkSpec):
             raise InputValidationError("pd_link", "must be a PDLinkSpec")
+        if (self.prefill_context is None) != (self.decode_context is None):
+            missing = (
+                "prefill_context"
+                if self.prefill_context is None
+                else "decode_context"
+            )
+            raise InputValidationError(
+                missing, "must be present when the other phase has context"
+            )
+        for path, context in (
+            ("prefill_context", self.prefill_context),
+            ("decode_context", self.decode_context),
+        ):
+            if context is not None and not isinstance(context, SearchContext):
+                raise InputValidationError(
+                    path, "must be a SearchContext or None"
+                )
         scenarios = _validate_scenarios(self.scenario_set)
         _validated_link_values(self.pd_link)
         normalized_scenario_set = ScenarioSet(
@@ -935,4 +954,6 @@ def pair_stage_results(
         dominant_rejection=_dominant_rejection(ordered),
         scenario_set=normalized_scenario_set,
         pd_link=pd_link,
+        prefill_context=prefill_result.context,
+        decode_context=decode_result.context,
     )

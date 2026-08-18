@@ -609,6 +609,38 @@ class PDPairSearchTests(unittest.TestCase):
             "prefill_result.context.scenario_set",
         )
 
+    def test_pair_result_preserves_both_phase_contexts_and_validates_them(self):
+        scenario_set = make_scenario_set()
+        prefill = with_context(
+            make_search_result((make_prefill_candidate(),)), scenario_set
+        )
+        decode = with_context(
+            make_search_result((make_decode_candidate(),)), scenario_set
+        )
+
+        result = pair_stage_results(
+            prefill,
+            decode,
+            make_pd_link(),
+            scenario_set,
+            {"interactive": 1_000_000},
+        )
+
+        self.assertIs(result.prefill_context, prefill.context)
+        self.assertIs(result.decode_context, decode.context)
+        context_free = replace(
+            result, prefill_context=None, decode_context=None
+        )
+        self.assertIsNone(context_free.prefill_context)
+        for changes, path in (
+            ({"decode_context": None}, "decode_context"),
+            ({"prefill_context": "bad"}, "prefill_context"),
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(InputValidationError) as caught:
+                    replace(result, **changes)
+                self.assertEqual(caught.exception.path, path)
+
     def test_phase_context_presence_model_and_precision_must_match(self):
         scenario_set = make_scenario_set()
         base_prefill = make_search_result((make_prefill_candidate(),))

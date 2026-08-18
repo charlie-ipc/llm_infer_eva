@@ -173,8 +173,12 @@ python -m infersim search --model hf_configs/qwen3-8B_config.json --hardware exa
 python -m infersim pair-pd --model hf_configs/qwen3-8B_config.json --prefill-hardware examples/search/custom_npu.json --decode-hardware examples/search/custom_npu.json --pd-link examples/search/pd_link.json --precision examples/search/w4a8.json --scenarios examples/search/scenarios.json --prefill-search-space examples/search/search_space.json --decode-search-space examples/search/search_space.json --output results/pd-system
 ```
 
-Omit a search-space option to use the built-in power-of-two grid up to 64
-cards. Every valid replica obeys:
+Omit a search-space option to use the bounded CLI default: total cards
+`[1, 2, 4, 8]`, replicas `[1, 2]`, attention TP `[1, 2, 4]`, attention DP
+`[1, 2]`, MoE TP `[1, 2, 4]`, expert parallel `[1, 2]`, and batch sizes
+`[1, 4, 16]`. This is 864 raw combinations with at most eight cards. Use an
+explicit search-space JSON for larger card counts or wider axes. Every valid
+replica obeys:
 
 ```text
 attention_tp * attention_dp == moe_tp * expert_parallel == cards_per_replica
@@ -183,8 +187,9 @@ total_cards == replicas * cards_per_replica
 
 `attention_dp` shards attention work within one whole-model replica. `replicas`
 duplicates the entire model and scales request throughput. It is therefore not
-the same DP dimension. Dense models require `expert_parallel == 1`; MoE plans
-may shard routed experts with EP while their attention width remains legal.
+the same DP dimension. Dense models additionally require `attention_dp == 1`,
+`expert_parallel == 1`, and `moe_tp == attention_tp`. MoE plans may shard
+routed experts with EP while their attention width remains legal.
 
 The cost model derives GEMM and VECTOR time from operation shapes, tiling,
 engine/vector alignment, memory traffic, and communication; there is no manual
@@ -210,12 +215,37 @@ total cards, minimizes known hourly cost, maximizes per-card request capacity,
 and finally applies stable candidate IDs. Pareto reports retain nondominated
 card/cost/capacity/latency alternatives.
 
-Each stage directory contains `all_candidates.csv`,
-`feasible_candidates.csv`, `pareto_frontier.csv`, `recommendation.json`, and
-`summary.txt`. The `pd/` directory uses `all_pairs.csv`, `feasible_pairs.csv`,
-`pareto_frontier.csv`, `recommendation.json`, and `summary.txt`. Reports are
-written even when no feasible recommendation exists; the command then exits 1.
-Input and schema errors retain their field path and exit 2.
+Each stage directory contains:
+
+- `all_candidates.csv`: every raw parallel-plan combination, including invalid
+  plans, aggregate metrics, warnings, and rejection diagnostics.
+- `feasible_candidates.csv`: only plans satisfying memory, rate, concurrency,
+  and the selected scenario-policy constraints.
+- `pareto_frontier.csv`: feasible nondominated card, cost, capacity, and stage
+  latency alternatives.
+- `recommendation.json`: the selected plan, complete per-scenario metrics,
+  bottleneck, assumptions, and normalized model/hardware/search inputs.
+- `summary.txt`: the selected plan and cards, SLO state, bottleneck, and leading
+  rejection reasons in a concise text form.
+
+The `pd/` directory contains:
+
+- `all_pairs.csv`: every retained prefill/decode pair with both plan summaries,
+  cards, cost, capacity, latency, bottleneck, reasons, and transfer metrics.
+- `feasible_pairs.csv`: only system pairs satisfying phase, link, concurrency,
+  TTFT, and TPOT constraints.
+- `pareto_frontier.csv`: nondominated feasible system-level pair alternatives.
+- `recommendation.json`: the selected pair with complete PD metrics, phase
+  candidate summaries, transfer payload/time/capacity, assumptions, and all
+  normalized phase/scenario/link inputs.
+- `summary.txt`: the selected phase IDs, total cards, capacity, TTFT/TPOT,
+  bottleneck, and SLO state, or the dominant rejection when none is feasible.
+
+Reports are written even when no feasible recommendation exists; the command
+then exits 1. Input and schema errors, invalid UTF-8, duplicate JSON keys, and
+output I/O errors are concise stderr diagnostics and exit 2. A `pair-pd` result
+root is published as one generation, so `prefill/`, `decode/`, and `pd/` never
+mix results from different runs.
 
 This is an analytical planning model, not a measured serving benchmark or a
 P99 latency guarantee. The first version supports decoder-only dense/MoE models
