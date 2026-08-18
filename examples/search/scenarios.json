@@ -1,0 +1,15 @@
+{
+  "policy": "all",
+  "scenarios": [
+    {
+      "name": "interactive",
+      "input_length": 128,
+      "output_length": 32,
+      "request_rate": 0.001,
+      "concurrency": 1,
+      "ttft_limit_ms": 1000000,
+      "tpot_limit_ms": 1000000,
+      "weight": 1
+    }
+  ]
+}

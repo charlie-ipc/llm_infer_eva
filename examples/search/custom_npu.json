@@ -1,0 +1,40 @@
+{
+  "name": "Example 128GB NPU",
+  "memory_capacity_gb": 128,
+  "memory_bandwidth_gbps": 4000,
+  "cards_per_node": 8,
+  "compute_tflops": {
+    "gemm": {
+      "w4a4": 1200,
+      "w4a8": 900
+    },
+    "vector": {
+      "fp4": 160,
+      "int8": 120,
+      "bf16": 60,
+      "fp32": 30
+    }
+  },
+  "gemm_tile": {
+    "m": 128,
+    "n": 128,
+    "k": 64
+  },
+  "gemm_engines": 4,
+  "vector_width": 32,
+  "vector_units": 16,
+  "kernel_launch_latency_us": {
+    "gemm": 5,
+    "vector": 3,
+    "collective": 8
+  },
+  "interconnect": {
+    "intra_node_gbps": 900,
+    "intra_node_latency_us": 1,
+    "inter_node_gbps": 400,
+    "inter_node_latency_us": 5
+  },
+  "memory_reserve_fraction": 0.1,
+  "runtime_workspace_gb": 2,
+  "cost_per_card_hour": 2.5
+}

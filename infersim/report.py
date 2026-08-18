@@ -13,6 +13,7 @@ import tempfile
 
 from infersim.errors import InputValidationError
 from infersim.search.constraints import StageCandidate
+from infersim.search.pair import PDCandidate, PDSearchResult
 from infersim.search.runner import SearchResult, _base_reason, _rank_rejections
 
 
@@ -46,6 +47,32 @@ CSV_FIELDS = (
     "worst_memory_required_bytes",
     "worst_memory_margin_bytes",
     "component_bottleneck",
+)
+
+PD_CSV_FIELDS = (
+    "candidate_id",
+    "prefill_candidate_id",
+    "decode_candidate_id",
+    "prefill_plan",
+    "decode_plan",
+    "feasible",
+    "reason_codes",
+    "warning_codes",
+    "total_cards",
+    "hourly_cost",
+    "request_capacity",
+    "request_capacity_per_card",
+    "ttft_ms",
+    "tpot_ms",
+    "bottleneck",
+    "scenario_count",
+    "transfer_summary",
+)
+
+_PD_ASSUMPTIONS = (
+    "Prefill and decode stage candidates are evaluated independently before pairing.",
+    "TTFT includes prefill latency and one KV/state transfer to decode.",
+    "The PD link is modeled analytically from payload, effective bandwidth, latency, and concurrency.",
 )
 
 
@@ -550,6 +577,215 @@ def _report_contents(result: SearchResult) -> dict[str, str]:
     }
 
 
+def _plan_summary(candidate: StageCandidate) -> str:
+    plan = candidate.plan
+    return (
+        f"replicas={plan.replicas},attention_tp={plan.attention_tp},"
+        f"attention_dp={plan.attention_dp},moe_tp={plan.moe_tp},"
+        f"expert_parallel={plan.expert_parallel},batch_size={plan.batch_size}"
+    )
+
+
+def _pd_metric_payload(metric, index: int) -> dict:
+    path = f"metrics[{index}]"
+    transfer = metric.transfer
+    return {
+        "bottleneck": metric.bottleneck,
+        "decode_candidate_id": metric.decode_candidate_id,
+        "decode_request_capacity": _rounded(
+            metric.decode_request_capacity,
+            6,
+            f"{path}.decode_request_capacity",
+        ),
+        "feasible": metric.feasible,
+        "payload_bytes": _rounded(
+            transfer.payload_bytes, 6, f"{path}.transfer.payload_bytes"
+        ),
+        "prefill_candidate_id": metric.prefill_candidate_id,
+        "prefill_request_capacity": _rounded(
+            metric.prefill_request_capacity,
+            6,
+            f"{path}.prefill_request_capacity",
+        ),
+        "reason_codes": list(metric.reason_codes),
+        "scenario_name": metric.scenario_name,
+        "system_request_capacity": _rounded(
+            metric.system_request_capacity,
+            6,
+            f"{path}.system_request_capacity",
+        ),
+        "tpot_ms": _rounded(metric.tpot_ms, 6, f"{path}.tpot_ms"),
+        "transfer": {
+            "concurrency_feasible": transfer.concurrency_feasible,
+            "concurrent_transfers_required": transfer.concurrent_transfers_required,
+            "effective_bandwidth_bytes_per_second": _rounded(
+                transfer.effective_bandwidth_bytes_per_second,
+                6,
+                f"{path}.transfer.effective_bandwidth_bytes_per_second",
+            ),
+            "link_request_capacity": _rounded(
+                transfer.link_request_capacity,
+                6,
+                f"{path}.transfer.link_request_capacity",
+            ),
+            "payload_bytes": _rounded(
+                transfer.payload_bytes,
+                6,
+                f"{path}.transfer.payload_bytes",
+            ),
+            "scenario_name": transfer.scenario_name,
+            "transfer_seconds": _rounded(
+                transfer.transfer_seconds,
+                12,
+                f"{path}.transfer.transfer_seconds",
+            ),
+        },
+        "ttft_ms": _rounded(metric.ttft_ms, 6, f"{path}.ttft_ms"),
+        "warning_codes": list(metric.warnings),
+    }
+
+
+def _pd_candidate_payload(candidate: PDCandidate) -> dict:
+    metrics = tuple(sorted(candidate.metrics, key=lambda item: item.scenario_name))
+    return {
+        "candidate_id": candidate.candidate_id,
+        "decode_candidate": _candidate_payload(
+            "decode", candidate.decode_candidate
+        ),
+        "decode_candidate_id": candidate.decode_candidate_id,
+        "feasible": candidate.feasible,
+        "hourly_cost": _rounded(candidate.hourly_cost, 6, "hourly_cost"),
+        "prefill_candidate": _candidate_payload(
+            "prefill", candidate.prefill_candidate
+        ),
+        "prefill_candidate_id": candidate.prefill_candidate_id,
+        "reason_codes": list(candidate.reason_codes),
+        "request_capacity": _rounded(
+            candidate.request_capacity, 6, "request_capacity"
+        ),
+        "request_capacity_per_card": _rounded(
+            candidate.request_capacity_per_card,
+            6,
+            "request_capacity_per_card",
+        ),
+        "scenarios": [
+            _pd_metric_payload(metric, index)
+            for index, metric in enumerate(metrics)
+        ],
+        "total_cards": candidate.total_cards,
+        "tpot_ms": _rounded(candidate.tpot_ms, 6, "tpot_ms"),
+        "ttft_ms": _rounded(candidate.ttft_ms, 6, "ttft_ms"),
+        "warning_codes": list(candidate.warnings),
+    }
+
+
+def _pd_transfer_summary(candidate: PDCandidate) -> str:
+    parts = []
+    for metric in sorted(candidate.metrics, key=lambda item: item.scenario_name):
+        transfer = metric.transfer
+        parts.append(
+            f"{metric.scenario_name}:payload_bytes={transfer.payload_bytes:.6f},"
+            f"effective_bw_Bps={transfer.effective_bandwidth_bytes_per_second:.6f},"
+            f"transfer_seconds={transfer.transfer_seconds:.12f},"
+            f"concurrency={transfer.concurrent_transfers_required},"
+            f"feasible={'true' if transfer.concurrency_feasible else 'false'}"
+        )
+    return ";".join(parts)
+
+
+def _pd_candidate_row(candidate: PDCandidate) -> dict:
+    bottlenecks = sorted({metric.bottleneck for metric in candidate.metrics})
+    return {
+        "candidate_id": candidate.candidate_id,
+        "prefill_candidate_id": candidate.prefill_candidate_id,
+        "decode_candidate_id": candidate.decode_candidate_id,
+        "prefill_plan": _plan_summary(candidate.prefill_candidate),
+        "decode_plan": _plan_summary(candidate.decode_candidate),
+        "feasible": "true" if candidate.feasible else "false",
+        "reason_codes": ";".join(candidate.reason_codes),
+        "warning_codes": ";".join(candidate.warnings),
+        "total_cards": candidate.total_cards,
+        "hourly_cost": _six(candidate.hourly_cost, "hourly_cost"),
+        "request_capacity": _six(
+            candidate.request_capacity, "request_capacity"
+        ),
+        "request_capacity_per_card": _six(
+            candidate.request_capacity_per_card, "request_capacity_per_card"
+        ),
+        "ttft_ms": _six(candidate.ttft_ms, "ttft_ms"),
+        "tpot_ms": _six(candidate.tpot_ms, "tpot_ms"),
+        "bottleneck": ";".join(bottlenecks),
+        "scenario_count": len(candidate.metrics),
+        "transfer_summary": _pd_transfer_summary(candidate),
+    }
+
+
+def _pd_csv_content(candidates) -> str:
+    handle = io.StringIO(newline="")
+    writer = csv.DictWriter(handle, fieldnames=PD_CSV_FIELDS)
+    writer.writeheader()
+    for candidate in sorted(candidates, key=lambda item: item.candidate_id):
+        writer.writerow(_pd_candidate_row(candidate))
+    return handle.getvalue()
+
+
+def _pd_summary(result: PDSearchResult) -> str:
+    selected = result.recommendation
+    lines = ["System: prefill/decode disaggregated"]
+    if selected is None:
+        lines.extend(
+            (
+                "Selected pair: none",
+                "Total cards: N/A",
+                "SLO status: no feasible pair",
+                f"Dominant rejection: {result.dominant_rejection or 'none'}",
+                "No feasible PD pair satisfied the requested constraints.",
+            )
+        )
+    else:
+        bottlenecks = sorted({metric.bottleneck for metric in selected.metrics})
+        lines.extend(
+            (
+                f"Selected pair: {selected.candidate_id}",
+                f"Prefill candidate: {selected.prefill_candidate_id}",
+                f"Decode candidate: {selected.decode_candidate_id}",
+                f"Total cards: {selected.total_cards}",
+                f"Request capacity: {selected.request_capacity:.6f} req/s",
+                f"TTFT: {selected.ttft_ms:.6f} ms",
+                f"TPOT: {selected.tpot_ms:.6f} ms",
+                f"Bottleneck: {';'.join(bottlenecks)}",
+                "SLO status: feasible",
+            )
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _pd_report_contents(result: PDSearchResult) -> dict[str, str]:
+    payload = {
+        "assumptions": list(_PD_ASSUMPTIONS),
+        "dominant_rejection": result.dominant_rejection,
+        "normalized_input_summary": {
+            "pd_link": _normalized_value(result.pd_link, "pd_link"),
+            "scenario_set": _normalized_value(
+                result.scenario_set, "scenario_set"
+            ),
+        },
+        "recommendation": None
+        if result.recommendation is None
+        else _pd_candidate_payload(result.recommendation),
+    }
+    return {
+        "all_pairs.csv": _pd_csv_content(result.candidates),
+        "feasible_pairs.csv": _pd_csv_content(result.feasible_candidates),
+        "pareto_frontier.csv": _pd_csv_content(result.pareto_frontier),
+        "recommendation.json": json.dumps(
+            payload, sort_keys=True, indent=2, allow_nan=False
+        )
+        + "\n",
+        "summary.txt": _pd_summary(result),
+    }
+
+
 def _temporary_file(output_dir: Path, name: str, content: str | bytes) -> Path:
     descriptor, raw_path = tempfile.mkstemp(
         dir=output_dir,
@@ -612,5 +848,15 @@ def write_stage_reports(output_dir: Path, result: SearchResult) -> None:
     if not isinstance(result, SearchResult):
         raise InputValidationError("result", "must be a SearchResult")
     contents = _report_contents(result)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _replace_reports(output_dir, contents)
+
+
+def write_pd_reports(output_dir: Path, result: PDSearchResult) -> None:
+    if not isinstance(output_dir, Path):
+        raise InputValidationError("output_dir", "must be a Path")
+    if not isinstance(result, PDSearchResult):
+        raise InputValidationError("result", "must be a PDSearchResult")
+    contents = _pd_report_contents(result)
     output_dir.mkdir(parents=True, exist_ok=True)
     _replace_reports(output_dir, contents)

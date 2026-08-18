@@ -138,6 +138,92 @@ TPOT (ms):                               38.00
 Throughput (TGS):                        2632
 ```
 
+## PD-Aware Deployment Search
+
+The `infersim` module adds an analytical deployment search for decoder-only
+LLMs. It reads a Hugging Face model config plus explicit hardware, precision,
+workload, and parallel-search inputs. Prefill and decode are searched
+independently, so they may use different accelerators and different TP/DP/EP
+plans; `pair-pd` then rate-matches the two phases and models the KV/state
+transfer between them.
+
+The checked-in inputs are intentionally small and complete:
+
+- [`custom_npu.json`](examples/search/custom_npu.json) defines DRAM capacity and
+  bandwidth, GEMM and VECTOR throughput, tile/engine geometry, launch latency,
+  intra/inter-node topology, and card cost. `compute_tflops.gemm` contains
+  W4A4 and W4A8 tensor modes, while `compute_tflops.vector` independently
+  contains FP4, INT8, BF16, and FP32 vector modes.
+- [`w4a8.json`](examples/search/w4a8.json) keeps weight, activation, vector,
+  accumulator, and KV-cache bit widths separate. To evaluate W4A4, set
+  `gemm_mode` to `w4a4`, `activation_bits` and `vector_bits` to `4`; the
+  hardware must provide the corresponding `w4a4` GEMM and `fp4` VECTOR modes.
+- [`scenarios.json`](examples/search/scenarios.json) gives ISL, OSL, request
+  rate, concurrency, TTFT/TPOT limits, weights, and the scenario policy.
+- [`search_space.json`](examples/search/search_space.json) gives the candidate
+  card counts, replicas, attention TP/DP, MoE TP/EP, and batch sizes.
+- [`pd_link.json`](examples/search/pd_link.json) gives PD bandwidth, latency,
+  efficiency, and the maximum concurrent transfers.
+
+Run the complete examples from the repository root:
+
+```powershell
+python -m infersim search --model hf_configs/qwen3-8B_config.json --hardware examples/search/custom_npu.json --precision examples/search/w4a8.json --scenarios examples/search/scenarios.json --search-space examples/search/search_space.json --stage prefill --output results/prefill
+python -m infersim search --model hf_configs/qwen3-8B_config.json --hardware examples/search/custom_npu.json --precision examples/search/w4a8.json --scenarios examples/search/scenarios.json --search-space examples/search/search_space.json --stage decode --output results/decode
+python -m infersim pair-pd --model hf_configs/qwen3-8B_config.json --prefill-hardware examples/search/custom_npu.json --decode-hardware examples/search/custom_npu.json --pd-link examples/search/pd_link.json --precision examples/search/w4a8.json --scenarios examples/search/scenarios.json --prefill-search-space examples/search/search_space.json --decode-search-space examples/search/search_space.json --output results/pd-system
+```
+
+Omit a search-space option to use the built-in power-of-two grid up to 64
+cards. Every valid replica obeys:
+
+```text
+attention_tp * attention_dp == moe_tp * expert_parallel == cards_per_replica
+total_cards == replicas * cards_per_replica
+```
+
+`attention_dp` shards attention work within one whole-model replica. `replicas`
+duplicates the entire model and scales request throughput. It is therefore not
+the same DP dimension. Dense models require `expert_parallel == 1`; MoE plans
+may shard routed experts with EP while their attention width remains legal.
+
+The cost model derives GEMM and VECTOR time from operation shapes, tiling,
+engine/vector alignment, memory traffic, and communication; there is no manual
+prefill/decode efficiency knob. W4A4 and W4A8 select separate GEMM peaks, and
+vector kernels use the mode implied by `vector_bits`.
+
+For each scenario, PD transfer uses:
+
+The existing `bandwidth_gbps` schema name denotes decimal GB/s, consistent
+with the hardware bandwidth fields.
+
+```text
+payload_bytes = prompt_KV_bytes + terminal_recurrent_state_bytes
+effective_bandwidth_bytes_per_second = bandwidth_gbps * 1e9 * efficiency
+transfer_seconds = latency_us / 1e6 + payload_bytes / effective_bandwidth
+PD_link_request_capacity = effective_bandwidth / payload_bytes
+first_decode_TTFT = prefill_latency + transfer_seconds + first_decode_step_latency
+```
+
+The pairer checks stage request capacity, link rate, transfer concurrency, TTFT,
+and TPOT. The default recommendation first requires feasibility, then minimizes
+total cards, minimizes known hourly cost, maximizes per-card request capacity,
+and finally applies stable candidate IDs. Pareto reports retain nondominated
+card/cost/capacity/latency alternatives.
+
+Each stage directory contains `all_candidates.csv`,
+`feasible_candidates.csv`, `pareto_frontier.csv`, `recommendation.json`, and
+`summary.txt`. The `pd/` directory uses `all_pairs.csv`, `feasible_pairs.csv`,
+`pareto_frontier.csv`, `recommendation.json`, and `summary.txt`. Reports are
+written even when no feasible recommendation exists; the command then exits 1.
+Input and schema errors retain their field path and exit 2.
+
+This is an analytical planning model, not a measured serving benchmark or a
+P99 latency guarantee. The first version supports decoder-only dense/MoE models
+with MHA/MQA/GQA, MLA, shared/routed experts, and supported full/linear-attention
+hybrids. Encoder-decoder models, multimodal roots, and arbitrary custom
+operators are rejected. Production selection should be calibrated against
+kernel and end-to-end measurements on the target stack.
+
 ## Acknowledgement
 
 This work is developed and maintained by Alimama AI Infra Team & Future Living Lab, Alibaba Group.

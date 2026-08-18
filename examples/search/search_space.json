@@ -1,0 +1,9 @@
+{
+  "total_cards": [1],
+  "replicas": [1],
+  "attention_tp": [1],
+  "attention_dp": [1],
+  "moe_tp": [1],
+  "expert_parallel": [1],
+  "batch_sizes": [1]
+}

@@ -1,0 +1,8 @@
+{
+  "gemm_mode": "w4a8",
+  "weight_bits": 4,
+  "activation_bits": 8,
+  "vector_bits": 8,
+  "accumulator_bits": 32,
+  "kv_cache_bits": 8
+}

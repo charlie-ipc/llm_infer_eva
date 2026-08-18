@@ -1,0 +1,6 @@
+{
+  "bandwidth_gbps": 800,
+  "latency_us": 10,
+  "efficiency": 0.9,
+  "max_concurrent_transfers": 64
+}
