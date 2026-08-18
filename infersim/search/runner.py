@@ -69,10 +69,11 @@ def _snapshot_scenarios(value: ScenarioSet) -> ScenarioSet:
             raise InputValidationError(
                 f"{path}.scenarios[{index}]", "must be a WorkloadScenario"
             )
+        name_path = f"{path}.scenarios[{index}].name"
+        if not isinstance(scenario.name, str) or not scenario.name:
+            raise InputValidationError(name_path, "must be a non-empty string")
         if scenario.name in names:
-            raise InputValidationError(
-                f"{path}.scenarios[{index}].name", "must be unique"
-            )
+            raise InputValidationError(name_path, "must be unique")
         names.add(scenario.name)
     return replace(value, scenarios=snapshot)
 
@@ -126,7 +127,10 @@ def _snapshot_performance(value, path: str):
         value_path = f"{path}.{mode}"
         if isinstance(throughput, bool) or not isinstance(throughput, Real):
             raise InputValidationError(value_path, "must be a number")
-        normalized_throughput = float(throughput)
+        try:
+            normalized_throughput = float(throughput)
+        except (OverflowError, ValueError):
+            raise InputValidationError(value_path, "must be finite") from None
         if not isfinite(normalized_throughput):
             raise InputValidationError(value_path, "must be finite")
         if normalized_throughput <= 0:

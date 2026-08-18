@@ -13,8 +13,9 @@ from unittest.mock import patch
 import infersim.report as report_module
 from infersim.errors import InputValidationError
 from infersim.report import CSV_FIELDS, write_stage_reports
+from infersim.schema.hardware import HardwareSpec
 from infersim.schema.parallel import PlanValidation, SearchSpace
-from infersim.schema.scenario import ScenarioSet
+from infersim.schema.scenario import ScenarioSet, WorkloadScenario
 from infersim.search import (
     CandidateDiagnostic,
     SearchContext,
@@ -116,10 +117,27 @@ class SearchResultTests(unittest.TestCase):
             "search_space": make_search_space(),
             "assumptions": ("assumption",),
         }
+        base_scenario = make_scenario()
+        invalid_name_scenario = WorkloadScenario(
+            **{
+                item.name: []
+                if item.name == "name"
+                else getattr(base_scenario, item.name)
+                for item in fields(WorkloadScenario)
+            }
+        )
         cases = (
             (
                 {"scenario_set": ScenarioSet("all", [object()])},
                 "context.scenario_set.scenarios[0]",
+            ),
+            (
+                {
+                    "scenario_set": ScenarioSet(
+                        "all", [invalid_name_scenario]
+                    )
+                },
+                "context.scenario_set.scenarios[0].name",
             ),
             (
                 {
@@ -159,6 +177,35 @@ class SearchResultTests(unittest.TestCase):
                 with self.assertRaises(InputValidationError) as caught:
                     SearchContext(**(defaults | override))
                 self.assertEqual(caught.exception.path, path)
+
+    def test_context_normalizes_performance_overflow_errors_with_exact_paths(self):
+        defaults = {
+            "model": make_dense_model(),
+            "precision": make_w4a8_precision(),
+            "scenario_set": make_scenario_set(),
+            "search_space": make_search_space(),
+            "assumptions": ("assumption",),
+        }
+        cases = (
+            ("gemm_tflops", "w4a8"),
+            ("vector_tflops", "int8"),
+        )
+        for field, mode in cases:
+            with self.subTest(field=field):
+                base_hardware = make_hardware()
+                values = {
+                    item.name: getattr(base_hardware, item.name)
+                    for item in fields(HardwareSpec)
+                }
+                values[field] = {mode: 10**10000}
+                hardware = HardwareSpec(**values)
+                with self.assertRaises(InputValidationError) as caught:
+                    SearchContext(hardware=hardware, **defaults)
+                self.assertEqual(
+                    caught.exception.path,
+                    f"context.hardware.{field}.{mode}",
+                )
+                self.assertEqual(caught.exception.message, "must be finite")
 
     def test_rejects_wrong_types_stages_and_inconsistent_subsets(self):
         prefill = make_candidate(candidate_id="prefill")
