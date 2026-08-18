@@ -153,6 +153,25 @@ def make_owned_pair_output(root):
             )
 
 
+def make_junction(link, target):
+    if not hasattr(Path, "is_junction"):
+        return False, "Path.is_junction is unavailable"
+    try:
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            text=True,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except OSError as error:
+        return False, str(error)
+    if result.returncode != 0 or not link.is_junction():
+        detail = result.stderr.strip() or result.stdout.strip()
+        return False, detail or "junction creation failed"
+    return True, ""
+
+
 def run_main(*arguments):
     stdout = io.StringIO()
     stderr = io.StringIO()
@@ -572,6 +591,92 @@ class SearchCliTests(unittest.TestCase):
             self.assertEqual(tree_snapshot(output), before)
             self.assertEqual({path.name for path in parent.iterdir()}, {"results"})
 
+    def test_pair_pd_backup_cleanup_failure_keeps_committed_new_reports(self):
+        with tempfile.TemporaryDirectory(prefix="infersim cleanup commit ") as temporary:
+            parent = Path(temporary)
+            output = parent / "results"
+            make_owned_pair_output(output)
+            real_rmtree = cli.shutil.rmtree
+
+            def partially_remove_backup(path):
+                path = Path(path)
+                if ".results.backup-" in path.name:
+                    (path / "prefill" / "summary.txt").unlink()
+                    raise PermissionError("injected partial backup cleanup")
+                return real_rmtree(path)
+
+            with patch(
+                "infersim.cli.shutil.rmtree", side_effect=partially_remove_backup
+            ):
+                code, stdout, stderr = run_main(*pair_arguments(output))
+
+            self.assertEqual(code, 2)
+            self.assertEqual(stdout, "")
+            self.assertNotIn("Traceback", stderr)
+            self.assertIn(f"new reports published at {output.absolute()}", stderr)
+            self.assertIn("backup cleanup failed at", stderr)
+            self.assertEqual(
+                {path.name for path in output.iterdir()},
+                {PAIR_MARKER, "prefill", "decode", "pd"},
+            )
+            self.assertEqual((output / PAIR_MARKER).read_bytes(), PAIR_MARKER_BYTES)
+            for directory, report_names in (
+                ("prefill", STAGE_REPORTS),
+                ("decode", STAGE_REPORTS),
+                ("pd", PD_REPORTS),
+            ):
+                report_root = output / directory
+                self.assertEqual(
+                    {path.name for path in report_root.iterdir()}, report_names
+                )
+                self.assertTrue(
+                    all(
+                        not path.read_bytes().startswith(b"old:")
+                        for path in report_root.iterdir()
+                    )
+                )
+            residual = tuple(
+                path for path in parent.iterdir() if ".results.backup-" in path.name
+            )
+            self.assertEqual(len(residual), 1)
+            self.assertFalse(
+                (residual[0] / "prefill" / "summary.txt").exists()
+            )
+            self.assertFalse(
+                any(".tmp-" in path.name for path in parent.iterdir())
+            )
+
+    def test_pair_pd_non_io_backup_cleanup_error_keeps_committed_output(self):
+        with tempfile.TemporaryDirectory(prefix="infersim cleanup runtime ") as temporary:
+            parent = Path(temporary)
+            output = parent / "results"
+            make_owned_pair_output(output)
+            real_rmtree = cli.shutil.rmtree
+
+            def fail_backup_cleanup(path):
+                if ".results.backup-" in Path(path).name:
+                    raise RuntimeError("injected cleanup programming error")
+                return real_rmtree(path)
+
+            with patch(
+                "infersim.cli.shutil.rmtree", side_effect=fail_backup_cleanup
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "injected cleanup programming error"
+                ):
+                    run_main(*pair_arguments(output))
+
+            self.assertEqual((output / PAIR_MARKER).read_bytes(), PAIR_MARKER_BYTES)
+            self.assertFalse(
+                (output / "prefill" / "summary.txt").read_bytes().startswith(
+                    b"old:"
+                )
+            )
+            residual = tuple(
+                path for path in parent.iterdir() if ".results.backup-" in path.name
+            )
+            self.assertEqual(len(residual), 1)
+
     def test_pair_pd_rejects_an_unowned_nonempty_result_root(self):
         with tempfile.TemporaryDirectory(prefix="infersim publish success ") as temporary:
             parent = Path(temporary)
@@ -653,6 +758,49 @@ class SearchCliTests(unittest.TestCase):
             self.assertIn("symlink", result.stderr)
             self.assertTrue(output.is_symlink())
             self.assertEqual(tree_snapshot(target), before)
+
+    def test_pair_pd_rejects_junction_output_when_supported(self):
+        with tempfile.TemporaryDirectory(prefix="infersim ownership junction ") as temporary:
+            parent = Path(temporary)
+            target = parent / "target"
+            output = parent / "results"
+            make_owned_pair_output(target)
+            before = tree_snapshot(target)
+            created, detail = make_junction(output, target)
+            if not created:
+                self.skipTest(f"directory junctions unavailable: {detail}")
+            try:
+                result = run_cli(*pair_arguments(output))
+
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, "")
+                self.assertIn(
+                    "output must not be a symlink or junction", result.stderr
+                )
+                self.assertTrue(output.is_junction())
+                self.assertEqual(tree_snapshot(target), before)
+            finally:
+                if output.is_junction():
+                    output.rmdir()
+
+    def test_generated_junction_is_never_traversed_during_cleanup(self):
+        with tempfile.TemporaryDirectory(prefix="infersim cleanup junction ") as temporary:
+            parent = Path(temporary).absolute()
+            target = parent / "target"
+            generated = parent / ".results.tmp-junction"
+            target.mkdir()
+            (target / "keep.txt").write_bytes(b"keep")
+            created, detail = make_junction(generated, target)
+            if not created:
+                self.skipTest(f"directory junctions unavailable: {detail}")
+            try:
+                with self.assertRaisesRegex(RuntimeError, "link or junction"):
+                    cli._remove_generated_tree(generated, parent, "staging")
+                self.assertTrue(generated.is_junction())
+                self.assertEqual((target / "keep.txt").read_bytes(), b"keep")
+            finally:
+                if generated.is_junction():
+                    generated.rmdir()
 
     def test_pair_pd_runtime_publish_failure_restores_old_tree_and_reraises(self):
         with tempfile.TemporaryDirectory(prefix="infersim runtime rollback ") as temporary:

@@ -515,20 +515,18 @@ class PDSearchResult:
                 normalized_scenario_set,
                 self.pd_link,
             )
-            if allowed_prefill is not None and _stage_semantic_key(
-                candidate.prefill_candidate
-            ) not in {
-                _stage_semantic_key(value) for value in allowed_prefill
-            }:
+            if (
+                allowed_prefill is not None
+                and candidate.prefill_candidate not in allowed_prefill
+            ):
                 raise InputValidationError(
                     f"candidates[{index}].prefill_candidate",
                     "must come from the bound prefill result",
                 )
-            if allowed_decode is not None and _stage_semantic_key(
-                candidate.decode_candidate
-            ) not in {
-                _stage_semantic_key(value) for value in allowed_decode
-            }:
+            if (
+                allowed_decode is not None
+                and candidate.decode_candidate not in allowed_decode
+            ):
                 raise InputValidationError(
                     f"candidates[{index}].decode_candidate",
                     "must come from the bound decode result",

@@ -97,10 +97,19 @@ def _safe_io_detail(error: OSError) -> str:
     return detail if detail.isascii() else type(error).__name__
 
 
+def _is_link_like(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    return bool(is_junction is not None and is_junction())
+
+
 def _pair_output_preflight(output: Path) -> None:
     try:
-        if output.is_symlink():
-            raise CliInputError(f"{output}: output must not be a symlink")
+        if _is_link_like(output):
+            raise CliInputError(
+                f"{output}: output must not be a symlink or junction"
+            )
         if not output.exists():
             return
         if not output.is_dir():
@@ -121,7 +130,7 @@ def _pair_output_preflight(output: Path) -> None:
             )
         marker = output / _PAIR_OUTPUT_MARKER
         if (
-            marker.is_symlink()
+            _is_link_like(marker)
             or not marker.is_file()
             or marker.read_bytes() != _PAIR_OUTPUT_MARKER_BYTES
         ):
@@ -134,14 +143,14 @@ def _pair_output_preflight(output: Path) -> None:
             ("pd", _PD_REPORT_NAMES),
         ):
             report_root = output / directory
-            if report_root.is_symlink() or not report_root.is_dir():
+            if _is_link_like(report_root) or not report_root.is_dir():
                 raise CliInputError(
                     f"{output}: not an owned InferSim PD output; "
                     f"{directory} must be a regular directory"
                 )
             reports = tuple(report_root.iterdir())
             if {report.name for report in reports} != expected_files or any(
-                report.is_symlink() or not report.is_file()
+                _is_link_like(report) or not report.is_file()
                 for report in reports
             ):
                 raise CliInputError(
@@ -169,8 +178,10 @@ def _remove_generated_tree(path: Path, parent: Path, label: str) -> None:
     path = _generated_child(path, parent, label)
     if not path.exists():
         return
-    if path.is_symlink() or not path.is_dir():
-        raise RuntimeError(f"refusing to clean invalid {label} path {path}")
+    if _is_link_like(path) or not path.is_dir():
+        raise RuntimeError(
+            f"refusing to clean {label} link or junction path {path}"
+        )
     shutil.rmtree(path)
 
 
@@ -183,7 +194,9 @@ def _reserve_generated_path(parent: Path, prefix: str, label: str) -> Path:
 
 def _restore_backup(backup: Path, output: Path, parent: Path) -> None:
     backup = _generated_child(backup, parent, "backup")
-    if output.exists() or output.is_symlink():
+    if _is_link_like(backup) or not backup.is_dir():
+        raise RuntimeError(f"refusing to restore invalid backup path {backup}")
+    if output.exists() or _is_link_like(output):
         raise RuntimeError(f"refusing to restore backup over {output}")
     for attempt in range(3):
         try:
@@ -204,7 +217,6 @@ def _write_pair_reports(output, prefill, decode, paired) -> None:
     staging = None
     backup = None
     old_moved = False
-    published = False
     prefix = f".{output.name or 'infersim'}."
     try:
         parent.mkdir(parents=True, exist_ok=True)
@@ -224,23 +236,10 @@ def _write_pair_reports(output, prefill, decode, paired) -> None:
             os.replace(output, backup)
             old_moved = True
         os.replace(staging, output)
-        published = True
-        if backup is not None:
-            _remove_generated_tree(backup, parent, "backup")
-            backup = None
         staging = None
     except BaseException as error:
         try:
             if old_moved and backup is not None and backup.exists():
-                if published and output.exists():
-                    if staging is None:
-                        staging = _reserve_generated_path(
-                            parent,
-                            prefix + "rollback-",
-                            "rollback staging",
-                        )
-                    os.replace(output, staging)
-                    published = False
                 _restore_backup(backup, output, parent)
                 backup = None
                 old_moved = False
@@ -260,11 +259,14 @@ def _write_pair_reports(output, prefill, decode, paired) -> None:
                 _remove_generated_tree(staging, parent, "staging")
             except OSError:
                 pass
-        if backup is not None and not old_moved:
-            try:
-                _remove_generated_tree(backup, parent, "backup")
-            except OSError:
-                pass
+    if backup is not None:
+        try:
+            _remove_generated_tree(backup, parent, "backup")
+        except OSError as error:
+            raise CliInputError(
+                f"new reports published at {output}; backup cleanup failed at "
+                f"{backup}: {_safe_io_detail(error)}"
+            ) from None
 
 
 def _run_search(args) -> int:

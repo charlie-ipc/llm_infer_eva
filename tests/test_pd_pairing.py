@@ -682,28 +682,28 @@ class PDPairSearchTests(unittest.TestCase):
 
     def test_pair_result_rejects_candidate_outside_bound_stage_result(self):
         scenario_set = make_scenario_set()
-        allowed_prefill = with_context(
-            make_search_result(
-                (
-                    make_prefill_candidate(
-                        candidate_id="allowed",
-                        total_cards=1,
-                        request_capacity=100,
-                    ),
+        source_candidate = make_prefill_candidate(
+            candidate_id="source",
+            total_cards=1,
+            request_capacity=100,
+        )
+        alias_candidate = replace(
+            source_candidate,
+            candidate_id="alias",
+            metrics=tuple(
+                replace(
+                    metric,
+                    useful_gemm_ops=metric.useful_gemm_ops + 1,
                 )
+                for metric in source_candidate.metrics
             ),
+        )
+        allowed_prefill = with_context(
+            make_search_result((source_candidate,)),
             scenario_set,
         )
         other_prefill = with_context(
-            make_search_result(
-                (
-                    make_prefill_candidate(
-                        candidate_id="other",
-                        total_cards=2,
-                        request_capacity=50,
-                    ),
-                )
-            ),
+            make_search_result((alias_candidate,)),
             scenario_set,
         )
         decode = with_context(
