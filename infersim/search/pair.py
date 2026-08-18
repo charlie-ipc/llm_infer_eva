@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from math import inf, isfinite
+from math import inf, isclose, isfinite
 from numbers import Real
 
 from infersim.cost.pd import (
@@ -129,6 +129,14 @@ class PDCandidate:
             raise InputValidationError(
                 "decode_candidate", "must be a StageCandidate"
             )
+        if not self.prefill_candidate.feasible:
+            raise InputValidationError(
+                "prefill_candidate.feasible", "must be true"
+            )
+        if not self.decode_candidate.feasible:
+            raise InputValidationError(
+                "decode_candidate.feasible", "must be true"
+            )
         if self.prefill_candidate_id != self.prefill_candidate.candidate_id:
             raise InputValidationError(
                 "prefill_candidate_id", "must equal prefill candidate ID"
@@ -137,7 +145,9 @@ class PDCandidate:
             raise InputValidationError(
                 "decode_candidate_id", "must equal decode candidate ID"
             )
-        expected_id = f"{self.prefill_candidate_id}::{self.decode_candidate_id}"
+        expected_id = _pair_candidate_id(
+            self.prefill_candidate_id, self.decode_candidate_id
+        )
         if self.candidate_id != expected_id:
             raise InputValidationError(
                 "candidate_id", "must be derived from the phase candidate IDs"
@@ -164,6 +174,17 @@ class PDCandidate:
             raise InputValidationError("feasible", "must be a boolean")
         reasons = _string_tuple(self.reason_codes, "reason_codes")
         warnings = _string_tuple(self.warnings, "warnings")
+        expected_reasons = tuple(
+            dict.fromkeys(
+                reason
+                for metric in metrics
+                for reason in metric.reason_codes
+            )
+        )
+        if reasons != expected_reasons:
+            raise InputValidationError(
+                "reason_codes", "must equal the metric rejection reasons"
+            )
         if self.feasible != (not reasons):
             raise InputValidationError(
                 "feasible", "must be true exactly when reason_codes is empty"
@@ -227,12 +248,14 @@ def _recommendation(candidates: Sequence[PDCandidate]) -> PDCandidate | None:
     feasible = tuple(candidate for candidate in candidates if candidate.feasible)
     if not feasible:
         return None
-    use_cost = all(candidate.hourly_cost is not None for candidate in feasible)
+    use_cost = any(candidate.hourly_cost is not None for candidate in feasible)
 
     def key(candidate: PDCandidate) -> tuple:
         value = (candidate.total_cards,)
         if use_cost:
-            value += (candidate.hourly_cost,)
+            value += (
+                inf if candidate.hourly_cost is None else candidate.hourly_cost,
+            )
         return value + (
             -candidate.request_capacity_per_card,
             candidate.prefill_candidate_id,
@@ -383,14 +406,25 @@ class PDSearchResult:
             raise InputValidationError("pd_link", "must be a PDLinkSpec")
         scenarios = _validate_scenarios(self.scenario_set)
         _validated_link_values(self.pd_link)
+        normalized_scenario_set = ScenarioSet(
+            self.scenario_set.policy, scenarios
+        )
+        for index, candidate in enumerate(candidates):
+            _validate_pd_candidate_context(
+                candidate,
+                index,
+                normalized_scenario_set,
+                self.pd_link,
+            )
         object.__setattr__(self, "candidates", candidates)
         object.__setattr__(self, "feasible_candidates", feasible)
         object.__setattr__(self, "pareto_frontier", frontier)
         object.__setattr__(
             self,
             "scenario_set",
-            ScenarioSet(self.scenario_set.policy, scenarios),
+            normalized_scenario_set,
         )
+        object.__setattr__(self, "pd_link", replace(self.pd_link))
 
 
 def _stage_semantic_key(candidate: StageCandidate) -> tuple:
@@ -402,6 +436,13 @@ def _stage_semantic_key(candidate: StageCandidate) -> tuple:
         candidate.request_capacity_per_card,
         candidate.ttft_ms,
         candidate.tpot_ms,
+    )
+
+
+def _pair_candidate_id(prefill_id: str, decode_id: str) -> str:
+    return (
+        f"pd:{len(prefill_id)}:{prefill_id}:"
+        f"{len(decode_id)}:{decode_id}"
     )
 
 
@@ -470,10 +511,162 @@ def _validate_scenarios(scenario_set: ScenarioSet) -> tuple[WorkloadScenario, ..
     return scenarios
 
 
+def _require_close(actual: float, expected: float, path: str) -> None:
+    if not isclose(actual, expected, rel_tol=1e-12, abs_tol=1e-15):
+        raise InputValidationError(path, "does not match the derived value")
+
+
+def _stage_scenarios_match(
+    candidate: StageCandidate,
+    expected_by_name: dict[str, WorkloadScenario],
+    path: str,
+) -> None:
+    by_name = {}
+    for index, scenario in enumerate(candidate.scenarios):
+        if scenario.name in by_name:
+            raise InputValidationError(
+                f"{path}[{index}].name", "must be unique"
+            )
+        by_name[scenario.name] = scenario
+    if set(by_name) != set(expected_by_name) or any(
+        by_name[name] != expected_by_name[name] for name in expected_by_name
+    ):
+        raise InputValidationError(
+            path, "must exactly match the result scenarios"
+        )
+
+
+def _validate_pd_candidate_context(
+    candidate: PDCandidate,
+    candidate_index: int,
+    scenario_set: ScenarioSet,
+    pd_link: PDLinkSpec,
+) -> None:
+    from infersim.cost.pd import evaluate_pd_pair as derive_pd_pair
+
+    base = f"candidates[{candidate_index}]"
+    expected_by_name = {
+        scenario.name: scenario for scenario in scenario_set.scenarios
+    }
+    metric_by_name = {metric.scenario_name: metric for metric in candidate.metrics}
+    if set(metric_by_name) != set(expected_by_name) or len(metric_by_name) != len(
+        candidate.metrics
+    ):
+        raise InputValidationError(
+            base + ".metrics", "scenario names must exactly match scenario_set"
+        )
+    _stage_scenarios_match(
+        candidate.prefill_candidate,
+        expected_by_name,
+        base + ".prefill_candidate.scenarios",
+    )
+    _stage_scenarios_match(
+        candidate.decode_candidate,
+        expected_by_name,
+        base + ".decode_candidate.scenarios",
+    )
+    expected_metrics = []
+    for metric_index, metric in enumerate(candidate.metrics):
+        metric_base = f"{base}.metrics[{metric_index}]"
+        scenario = expected_by_name[metric.scenario_name]
+        expected = derive_pd_pair(
+            candidate.prefill_candidate,
+            candidate.decode_candidate,
+            pd_link,
+            metric.transfer.payload_bytes,
+            scenario,
+        )
+        if scenario_set.policy == "weighted":
+            expected = _weighted_metric(expected)
+        expected_metrics.append(expected)
+        for field in (
+            "payload_bytes",
+            "effective_bandwidth_bytes_per_second",
+            "transfer_seconds",
+            "link_request_capacity",
+        ):
+            _require_close(
+                getattr(metric.transfer, field),
+                getattr(expected.transfer, field),
+                f"{metric_base}.transfer.{field}",
+            )
+        for field in (
+            "concurrent_transfers_required",
+            "concurrency_feasible",
+        ):
+            if getattr(metric.transfer, field) != getattr(
+                expected.transfer, field
+            ):
+                raise InputValidationError(
+                    f"{metric_base}.transfer.{field}",
+                    "does not match the derived value",
+                )
+        for field in (
+            "prefill_request_capacity",
+            "decode_request_capacity",
+            "system_request_capacity",
+            "ttft_ms",
+            "tpot_ms",
+        ):
+            _require_close(
+                getattr(metric, field),
+                getattr(expected, field),
+                f"{metric_base}.{field}",
+            )
+        for field in (
+            "bottleneck",
+            "feasible",
+            "reason_codes",
+            "warnings",
+        ):
+            if getattr(metric, field) != getattr(expected, field):
+                raise InputValidationError(
+                    f"{metric_base}.{field}",
+                    "does not match the derived value",
+                )
+
+    metrics = tuple(expected_metrics)
+    if scenario_set.policy == "all":
+        expected_capacity = min(
+            metric.system_request_capacity for metric in metrics
+        )
+        expected_ttft = max(metric.ttft_ms for metric in metrics)
+        expected_tpot = max(metric.tpot_ms for metric in metrics)
+    else:
+        total_weight = sum(
+            scenario.weight for scenario in scenario_set.scenarios
+        )
+
+        def weighted(field: str) -> float:
+            return sum(
+                getattr(
+                    next(
+                        metric
+                        for metric in metrics
+                        if metric.scenario_name == scenario.name
+                    ),
+                    field,
+                )
+                * scenario.weight
+                for scenario in scenario_set.scenarios
+            ) / total_weight
+
+        expected_capacity = weighted("system_request_capacity")
+        expected_ttft = weighted("ttft_ms")
+        expected_tpot = weighted("tpot_ms")
+    _require_close(
+        candidate.request_capacity,
+        expected_capacity,
+        base + ".request_capacity",
+    )
+    _require_close(candidate.ttft_ms, expected_ttft, base + ".ttft_ms")
+    _require_close(candidate.tpot_ms, expected_tpot, base + ".tpot_ms")
+
+
 def _validate_stage_result(
     result: SearchResult,
     expected_stage: str,
-    scenarios: tuple[WorkloadScenario, ...],
+    scenario_set: ScenarioSet,
 ) -> tuple[StageCandidate, ...]:
     path = f"{expected_stage}_result"
     if not isinstance(result, SearchResult):
@@ -482,7 +675,15 @@ def _validate_stage_result(
         raise InputValidationError(
             path + ".stage", f"must be '{expected_stage}'"
         )
-    expected_names = {scenario.name for scenario in scenarios}
+    scenarios = scenario_set.scenarios
+    expected_by_name = {scenario.name: scenario for scenario in scenarios}
+    expected_names = set(expected_by_name)
+    if result.context is not None:
+        if result.context.scenario_set != scenario_set:
+            raise InputValidationError(
+                path + ".context.scenario_set",
+                "must equal the PD pairing scenario_set",
+            )
     for candidate_index, candidate in enumerate(result.candidates):
         if not candidate.metrics:
             continue
@@ -501,10 +702,58 @@ def _validate_stage_result(
                 f"{path}.candidates[{candidate_index}].metrics",
                 "scenario names must exactly match scenario_set",
             )
+        if result.context is None:
+            candidate_by_name = {}
+            for scenario_index, scenario in enumerate(candidate.scenarios):
+                if scenario.name in candidate_by_name:
+                    raise InputValidationError(
+                        f"{path}.candidates[{candidate_index}].scenarios[{scenario_index}].name",
+                        "must be unique",
+                    )
+                candidate_by_name[scenario.name] = scenario
+            if set(candidate_by_name) != expected_names or any(
+                candidate_by_name[name] != expected_by_name[name]
+                for name in expected_names
+            ):
+                raise InputValidationError(
+                    f"{path}.candidates[{candidate_index}].scenarios",
+                    "must exactly match the PD pairing scenarios",
+                )
     return _pruned_stage_candidates(result)
 
 
-def _payloads(mapping, scenarios: tuple[WorkloadScenario, ...]) -> dict[str, int]:
+def _validate_context_compatibility(
+    prefill_result: SearchResult,
+    decode_result: SearchResult,
+) -> None:
+    prefill_context = prefill_result.context
+    decode_context = decode_result.context
+    if (prefill_context is None) != (decode_context is None):
+        missing = (
+            "prefill_result.context"
+            if prefill_context is None
+            else "decode_result.context"
+        )
+        raise InputValidationError(
+            missing, "must be present when the other phase has context"
+        )
+    if prefill_context is None:
+        return
+    if prefill_context.model != decode_context.model:
+        raise InputValidationError(
+            "decode_result.context.model",
+            "must equal prefill_result.context.model",
+        )
+    if prefill_context.precision != decode_context.precision:
+        raise InputValidationError(
+            "decode_result.context.precision",
+            "must equal prefill_result.context.precision",
+        )
+
+
+def _payloads(
+    mapping, scenarios: tuple[WorkloadScenario, ...]
+) -> dict[str, float]:
     if not isinstance(mapping, Mapping):
         raise InputValidationError(
             "kv_state_bytes_by_scenario", "must be a mapping"
@@ -521,9 +770,7 @@ def _payloads(mapping, scenarios: tuple[WorkloadScenario, ...]) -> dict[str, int
         path = f"kv_state_bytes_by_scenario.{name}"
         if name not in mapping:
             raise InputValidationError(path, "field is required")
-        value = mapping[name]
-        if type(value) is not int:
-            raise InputValidationError(path, "must be an integer")
+        value = _number(mapping[name], path)
         if value <= 0:
             raise InputValidationError(path, "must be positive")
         values[name] = value
@@ -598,7 +845,9 @@ def _build_candidate(
     if prefill.hourly_cost is not None and decode.hourly_cost is not None:
         hourly_cost = prefill.hourly_cost + decode.hourly_cost
     return PDCandidate(
-        candidate_id=f"{prefill.candidate_id}::{decode.candidate_id}",
+        candidate_id=_pair_candidate_id(
+            prefill.candidate_id, decode.candidate_id
+        ),
         prefill_candidate_id=prefill.candidate_id,
         decode_candidate_id=decode.candidate_id,
         prefill_candidate=prefill,
@@ -627,11 +876,12 @@ def pair_stage_results(
     _validated_link_values(pd_link)
     normalized_scenario_set = ScenarioSet(scenario_set.policy, scenarios)
     prefill_candidates = _validate_stage_result(
-        prefill_result, "prefill", scenarios
+        prefill_result, "prefill", normalized_scenario_set
     )
     decode_candidates = _validate_stage_result(
-        decode_result, "decode", scenarios
+        decode_result, "decode", normalized_scenario_set
     )
+    _validate_context_compatibility(prefill_result, decode_result)
     payloads = _payloads(kv_state_bytes_by_scenario, scenarios)
 
     candidates = []

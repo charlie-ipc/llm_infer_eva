@@ -16,6 +16,7 @@ from infersim.schema.scenario import ScenarioSet
 from infersim.search import (
     PDCandidate,
     PDSearchResult,
+    SearchContext,
     SearchResult,
     pair_stage_results,
 )
@@ -23,6 +24,7 @@ from tests.helpers import (
     make_decode_candidate,
     make_dense_model,
     make_hybrid_model,
+    make_hardware,
     make_mla_moe_model,
     make_metrics,
     make_pd_link,
@@ -30,9 +32,45 @@ from tests.helpers import (
     make_scenario,
     make_scenario_set,
     make_search_result,
+    make_search_space,
     make_w4a4_precision,
     make_w4a8_precision,
 )
+
+
+def with_context(
+    result,
+    scenario_set,
+    *,
+    model=None,
+    precision=None,
+):
+    return replace(
+        result,
+        context=SearchContext(
+            model=model or make_dense_model(),
+            hardware=make_hardware(),
+            precision=precision or make_w4a8_precision(),
+            scenario_set=scenario_set,
+            search_space=make_search_space(),
+            assumptions=("test",),
+        ),
+    )
+
+
+def with_only_pd_candidate(result, candidate):
+    return replace(
+        result,
+        candidates=(candidate,),
+        feasible_candidates=(candidate,) if candidate.feasible else (),
+        pareto_frontier=(candidate,) if candidate.feasible else (),
+        recommendation=candidate if candidate.feasible else None,
+        dominant_rejection=(
+            None
+            if candidate.feasible
+            else candidate.reason_codes[0].rsplit(":", 1)[-1]
+        ),
+    )
 
 
 class PDMetricTests(unittest.TestCase):
@@ -188,6 +226,23 @@ class PDMetricTests(unittest.TestCase):
             replace(metrics.transfer, payload_bytes=0)
         self.assertEqual(caught.exception.path, "payload_bytes")
 
+    def test_transfer_record_rejects_inconsistent_link_capacity(self):
+        metrics = evaluate_pd_pair(
+            make_prefill_candidate(),
+            make_decode_candidate(),
+            make_pd_link(),
+            1_000_000,
+            make_scenario(),
+        )
+        with self.assertRaises(InputValidationError) as caught:
+            replace(
+                metrics.transfer,
+                link_request_capacity=(
+                    metrics.transfer.link_request_capacity + 1
+                ),
+            )
+        self.assertEqual(caught.exception.path, "link_request_capacity")
+
     def test_concurrent_work_overflow_has_a_stable_path(self):
         with self.assertRaises(InputValidationError) as caught:
             evaluate_pd_pair(
@@ -225,6 +280,47 @@ class PDMetricTests(unittest.TestCase):
                 with self.assertRaises(InputValidationError) as caught:
                     evaluate_pd_pair(*args[:-1], scenario=args[-1])
                 self.assertEqual(caught.exception.path, path)
+
+    def test_fractional_payload_flows_through_transfer_formula(self):
+        scenario = make_scenario(input_length=1)
+        metrics = evaluate_pd_pair(
+            make_prefill_candidate(scenarios=(scenario,)),
+            make_decode_candidate(scenarios=(scenario,)),
+            make_pd_link(bandwidth_gbps=1, latency_us=0),
+            kv_state_bytes=1.5,
+            scenario=scenario,
+        )
+
+        self.assertEqual(metrics.transfer.payload_bytes, 1.5)
+        self.assertAlmostEqual(metrics.transfer.transfer_seconds, 1.5 / 1e9)
+        self.assertAlmostEqual(
+            metrics.transfer.link_request_capacity, 1e9 / 1.5
+        )
+        paired = pair_stage_results(
+            make_search_result(
+                (make_prefill_candidate(scenarios=(scenario,)),)
+            ),
+            make_search_result(
+                (make_decode_candidate(scenarios=(scenario,)),)
+            ),
+            make_pd_link(),
+            make_scenario_set((scenario,)),
+            {"interactive": 1.5},
+        )
+        self.assertEqual(
+            paired.candidates[0].metrics[0].transfer.payload_bytes, 1.5
+        )
+
+    def test_huge_direct_payload_is_a_validation_error(self):
+        with self.assertRaises(InputValidationError) as caught:
+            evaluate_pd_pair(
+                make_prefill_candidate(),
+                make_decode_candidate(),
+                make_pd_link(),
+                10**10000,
+                make_scenario(),
+            )
+        self.assertEqual(caught.exception.path, "kv_state_bytes")
 
     def test_pair_evaluator_requires_one_exact_scenario_metric(self):
         scenario = make_scenario(name="target")
@@ -299,6 +395,32 @@ class PDPayloadTests(unittest.TestCase):
             kv_bytes_per_request(model, precision, 19),
         )
 
+    def test_mla_fp4_payload_preserves_half_bytes(self):
+        model = make_mla_moe_model(
+            num_hidden_layers=1,
+            kv_lora_rank=2,
+            qk_nope_head_dim=3,
+            qk_rope_head_dim=1,
+        )
+        payload = pd_payload_bytes(
+            model,
+            make_w4a8_precision(kv_cache_bits=4),
+            make_scenario(input_length=1),
+        )
+
+        self.assertEqual(payload, 1.5)
+        self.assertIsInstance(payload, float)
+
+    def test_huge_recurrent_state_is_a_validation_error(self):
+        model = replace(
+            make_hybrid_model(), linear_key_head_dim=10**10000
+        )
+        with self.assertRaises(InputValidationError) as caught:
+            pd_payload_bytes(
+                model, make_w4a8_precision(), make_scenario(input_length=1)
+            )
+        self.assertEqual(caught.exception.path, "payload_bytes")
+
     def test_kv_precision_not_activation_precision_controls_payload(self):
         model = make_dense_model()
         scenario = make_scenario(input_length=16)
@@ -360,6 +482,45 @@ class PDPairSearchTests(unittest.TestCase):
         self.assertEqual(result.recommendation.prefill_candidate_id, "p2")
         self.assertEqual(result.recommendation.decode_candidate_id, "d4")
 
+    def test_pair_ids_use_unambiguous_length_prefixed_encoding(self):
+        prefill_candidates = (
+            make_prefill_candidate(
+                candidate_id="a::b", total_cards=1, request_capacity=50
+            ),
+            make_prefill_candidate(
+                candidate_id="a", total_cards=2, request_capacity=100
+            ),
+        )
+        decode_candidates = (
+            make_decode_candidate(
+                candidate_id="c", total_cards=1, request_capacity=50
+            ),
+            make_decode_candidate(
+                candidate_id="b::c", total_cards=2, request_capacity=100
+            ),
+        )
+
+        forward = pair_stage_results(
+            make_search_result(prefill_candidates),
+            make_search_result(decode_candidates),
+            make_pd_link(),
+            make_scenario_set(),
+            {"interactive": 1},
+        )
+        reverse = pair_stage_results(
+            make_search_result(tuple(reversed(prefill_candidates))),
+            make_search_result(tuple(reversed(decode_candidates))),
+            make_pd_link(),
+            make_scenario_set(),
+            {"interactive": 1},
+        )
+        ids = tuple(candidate.candidate_id for candidate in forward.candidates)
+
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertIn("pd:4:a::b:1:c", ids)
+        self.assertIn("pd:1:a:4:b::c", ids)
+        self.assertEqual(forward, reverse)
+
     def test_cost_is_sum_only_when_both_phase_costs_are_known(self):
         scenario_set = make_scenario_set()
         known = pair_stage_results(
@@ -380,7 +541,7 @@ class PDPairSearchTests(unittest.TestCase):
         self.assertEqual(known.recommendation.hourly_cost, 5)
         self.assertIsNone(unknown.recommendation.hourly_cost)
 
-    def test_mixed_unknown_pair_cost_omits_cost_for_recommendation(self):
+    def test_mixed_unknown_pair_cost_sorts_unknown_after_known(self):
         prefill = make_search_result(
             (
                 make_prefill_candidate(
@@ -395,13 +556,97 @@ class PDPairSearchTests(unittest.TestCase):
         )
         result = pair_stage_results(
             prefill,
-            make_search_result((make_decode_candidate(hourly_cost=None),)),
+            make_search_result((make_decode_candidate(hourly_cost=1),)),
             make_pd_link(),
             make_scenario_set(),
             {"interactive": 1_000_000},
         )
 
-        self.assertEqual(result.recommendation.prefill_candidate_id, "unknown")
+        self.assertEqual(result.recommendation.prefill_candidate_id, "known")
+
+    def test_same_name_different_scenario_fields_are_rejected_without_context(self):
+        stage_scenario = make_scenario(input_length=128)
+        pair_scenario = make_scenario(input_length=4096)
+        prefill = make_search_result(
+            (make_prefill_candidate(scenarios=(stage_scenario,)),)
+        )
+        decode = make_search_result(
+            (make_decode_candidate(scenarios=(stage_scenario,)),)
+        )
+
+        with self.assertRaises(InputValidationError) as caught:
+            pair_stage_results(
+                prefill,
+                decode,
+                make_pd_link(),
+                make_scenario_set((pair_scenario,)),
+                {"interactive": 1},
+            )
+        self.assertEqual(
+            caught.exception.path,
+            "prefill_result.candidates[0].scenarios",
+        )
+
+    def test_context_policy_and_scenarios_must_match_pair_context(self):
+        stage_set = make_scenario_set(policy="all")
+        prefill = with_context(
+            make_search_result((make_prefill_candidate(),)), stage_set
+        )
+        decode = with_context(
+            make_search_result((make_decode_candidate(),)), stage_set
+        )
+
+        with self.assertRaises(InputValidationError) as caught:
+            pair_stage_results(
+                prefill,
+                decode,
+                make_pd_link(),
+                make_scenario_set(policy="weighted"),
+                {"interactive": 1},
+            )
+        self.assertEqual(
+            caught.exception.path,
+            "prefill_result.context.scenario_set",
+        )
+
+    def test_phase_context_presence_model_and_precision_must_match(self):
+        scenario_set = make_scenario_set()
+        base_prefill = make_search_result((make_prefill_candidate(),))
+        base_decode = make_search_result((make_decode_candidate(),))
+        prefill = with_context(base_prefill, scenario_set)
+        cases = (
+            (
+                base_decode,
+                "decode_result.context",
+            ),
+            (
+                with_context(
+                    base_decode,
+                    scenario_set,
+                    model=make_dense_model(hidden_size=16, head_dim=8),
+                ),
+                "decode_result.context.model",
+            ),
+            (
+                with_context(
+                    base_decode,
+                    scenario_set,
+                    precision=make_w4a8_precision(kv_cache_bits=4),
+                ),
+                "decode_result.context.precision",
+            ),
+        )
+        for decode, path in cases:
+            with self.subTest(path=path):
+                with self.assertRaises(InputValidationError) as caught:
+                    pair_stage_results(
+                        prefill,
+                        decode,
+                        make_pd_link(),
+                        scenario_set,
+                        {"interactive": 1},
+                    )
+                self.assertEqual(caught.exception.path, path)
 
     def test_all_policy_rejects_slo_but_weighted_retains_warning(self):
         slow = make_scenario(
@@ -445,8 +690,12 @@ class PDPairSearchTests(unittest.TestCase):
             request_rate=15, ttft_limit_ms=1000, weight=1
         )
         result = pair_stage_results(
-            make_search_result((make_prefill_candidate(),)),
-            make_search_result((make_decode_candidate(),)),
+            make_search_result(
+                (make_prefill_candidate(scenarios=(scenario,)),)
+            ),
+            make_search_result(
+                (make_decode_candidate(scenarios=(scenario,)),)
+            ),
             make_pd_link(
                 bandwidth_gbps=1000,
                 latency_us=100_000,
@@ -647,6 +896,13 @@ class PDPairSearchTests(unittest.TestCase):
                 prefill,
                 decode,
                 make_scenario_set(),
+                {"interactive": 10**10000},
+                "kv_state_bytes_by_scenario.interactive",
+            ),
+            (
+                prefill,
+                decode,
+                make_scenario_set(),
                 {"interactive": 1, "extra": 1},
                 "kv_state_bytes_by_scenario.extra",
             ),
@@ -751,6 +1007,129 @@ class PDPairSearchTests(unittest.TestCase):
         with self.assertRaises(InputValidationError) as caught:
             replace(result, recommendation=None)
         self.assertEqual(caught.exception.path, "recommendation")
+
+    def test_pd_candidate_rejects_infeasible_phase_and_derived_reason_mismatch(self):
+        result = pair_stage_results(
+            make_search_result((make_prefill_candidate(),)),
+            make_search_result((make_decode_candidate(),)),
+            make_pd_link(),
+            make_scenario_set(),
+            {"interactive": 1},
+        )
+        candidate = result.candidates[0]
+        infeasible_prefill = replace(
+            candidate.prefill_candidate,
+            feasible=False,
+            reason_codes=("LOCAL_FAILURE",),
+        )
+        with self.assertRaises(InputValidationError) as caught:
+            replace(candidate, prefill_candidate=infeasible_prefill)
+        self.assertEqual(caught.exception.path, "prefill_candidate.feasible")
+
+        rejected_metric = replace(
+            candidate.metrics[0],
+            feasible=False,
+            reason_codes=("interactive:TTFT_SLO",),
+        )
+        with self.assertRaises(InputValidationError) as caught:
+            replace(candidate, metrics=(rejected_metric,))
+        self.assertEqual(caught.exception.path, "reason_codes")
+
+    def test_pd_result_rederives_link_scenario_and_metric_formulas(self):
+        scenario = make_scenario(ttft_limit_ms=1000)
+        result = pair_stage_results(
+            make_search_result(
+                (make_prefill_candidate(scenarios=(scenario,)),)
+            ),
+            make_search_result(
+                (make_decode_candidate(scenarios=(scenario,)),)
+            ),
+            make_pd_link(),
+            make_scenario_set((scenario,)),
+            {"interactive": 1_000_000},
+        )
+        cases = (
+            (
+                {"pd_link": make_pd_link(bandwidth_gbps=50)},
+                "candidates[0].metrics[0].transfer.effective_bandwidth_bytes_per_second",
+            ),
+            (
+                {
+                    "scenario_set": make_scenario_set(
+                        (replace(scenario, input_length=4096),)
+                    )
+                },
+                "candidates[0].prefill_candidate.scenarios",
+            ),
+            (
+                {
+                    "scenario_set": make_scenario_set(
+                        (replace(scenario, name="other"),)
+                    )
+                },
+                "candidates[0].metrics",
+            ),
+        )
+        for changes, path in cases:
+            with self.subTest(path=path):
+                with self.assertRaises(InputValidationError) as caught:
+                    replace(result, **changes)
+                self.assertEqual(caught.exception.path, path)
+
+        candidate = result.candidates[0]
+        metric = candidate.metrics[0]
+        forged_transfer = replace(
+            metric.transfer,
+            transfer_seconds=metric.transfer.transfer_seconds + 1,
+        )
+        forged_transfer_metric = replace(
+            metric,
+            transfer=forged_transfer,
+            ttft_ms=metric.ttft_ms + 1000,
+        )
+        forged_transfer_candidate = replace(
+            candidate,
+            metrics=(forged_transfer_metric,),
+            ttft_ms=candidate.ttft_ms + 1000,
+        )
+        with self.assertRaises(InputValidationError) as caught:
+            with_only_pd_candidate(result, forged_transfer_candidate)
+        self.assertEqual(
+            caught.exception.path,
+            "candidates[0].metrics[0].transfer.transfer_seconds",
+        )
+
+        forged_metric = replace(metric, ttft_ms=metric.ttft_ms + 1)
+        forged_candidate = replace(
+            candidate,
+            metrics=(forged_metric,),
+            ttft_ms=candidate.ttft_ms + 1,
+        )
+        with self.assertRaises(InputValidationError) as caught:
+            with_only_pd_candidate(result, forged_candidate)
+        self.assertEqual(caught.exception.path, "candidates[0].metrics[0].ttft_ms")
+
+    def test_pd_result_rederives_candidate_aggregates(self):
+        result = pair_stage_results(
+            make_search_result((make_prefill_candidate(),)),
+            make_search_result((make_decode_candidate(),)),
+            make_pd_link(),
+            make_scenario_set(),
+            {"interactive": 1},
+        )
+        candidate = result.candidates[0]
+        forged_capacity = candidate.request_capacity + 1
+        forged = replace(
+            candidate,
+            request_capacity=forged_capacity,
+            request_capacity_per_card=(
+                forged_capacity / candidate.total_cards
+            ),
+        )
+
+        with self.assertRaises(InputValidationError) as caught:
+            with_only_pd_candidate(result, forged)
+        self.assertEqual(caught.exception.path, "candidates[0].request_capacity")
 
 
 if __name__ == "__main__":

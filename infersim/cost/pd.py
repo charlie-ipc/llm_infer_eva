@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from math import ceil, isfinite
+from math import ceil, isclose, isfinite
 from numbers import Real
 from typing import TYPE_CHECKING
 
@@ -103,7 +103,7 @@ def _validated_link_values(pd_link: PDLinkSpec) -> tuple[float, float, float, in
 @dataclass(frozen=True)
 class PDTransferMetrics:
     scenario_name: str
-    payload_bytes: int
+    payload_bytes: float
     effective_bandwidth_bytes_per_second: float
     transfer_seconds: float
     link_request_capacity: float
@@ -115,7 +115,7 @@ class PDTransferMetrics:
             raise InputValidationError(
                 "scenario_name", "must be a non-empty string"
             )
-        _positive_integer(self.payload_bytes, "payload_bytes")
+        _number(self.payload_bytes, "payload_bytes", positive=True)
         _number(
             self.effective_bandwidth_bytes_per_second,
             "effective_bandwidth_bytes_per_second",
@@ -127,6 +127,19 @@ class PDTransferMetrics:
             "link_request_capacity",
             positive=True,
         )
+        expected_capacity = (
+            self.effective_bandwidth_bytes_per_second / self.payload_bytes
+        )
+        if not isclose(
+            self.link_request_capacity,
+            expected_capacity,
+            rel_tol=1e-12,
+            abs_tol=1e-15,
+        ):
+            raise InputValidationError(
+                "link_request_capacity",
+                "must equal effective bandwidth divided by payload bytes",
+            )
         _positive_integer(
             self.concurrent_transfers_required,
             "concurrent_transfers_required",
@@ -222,7 +235,7 @@ def pd_payload_bytes(
     model: ModelSpec,
     precision: PrecisionSpec,
     scenario: WorkloadScenario,
-) -> int:
+) -> float:
     """Return full prompt KV plus one terminal recurrent state."""
 
     if not isinstance(model, ModelSpec):
@@ -230,19 +243,19 @@ def pd_payload_bytes(
     if not isinstance(precision, PrecisionSpec):
         raise InputValidationError("precision", "must be a PrecisionSpec")
     _validate_scenario(scenario)
-    payload = kv_bytes_per_request(model, precision, scenario.input_length)
-    payload += recurrent_state_bytes_per_request(model)
     try:
-        normalized = int(payload)
+        payload = float(
+            kv_bytes_per_request(model, precision, scenario.input_length)
+        ) + float(recurrent_state_bytes_per_request(model))
     except (OverflowError, ValueError):
         raise InputValidationError("payload_bytes", "derived value must be finite") from None
-    if not isfinite(float(payload)):
+    if not isfinite(payload):
         raise InputValidationError("payload_bytes", "derived value must be finite")
-    if normalized <= 0 or normalized != payload:
+    if payload <= 0:
         raise InputValidationError(
-            "payload_bytes", "derived value must be a positive integer"
+            "payload_bytes", "derived value must be positive"
         )
-    return normalized
+    return payload
 
 
 def _find_metric(candidate: StageCandidate, stage: str, scenario_name: str):
@@ -284,11 +297,11 @@ def evaluate_pd_pair(
     prefill_candidate: StageCandidate,
     decode_candidate: StageCandidate,
     pd_link: PDLinkSpec,
-    kv_state_bytes: int,
+    kv_state_bytes: Real,
     scenario: WorkloadScenario,
 ) -> PDMetrics:
     _validate_scenario(scenario)
-    payload = _positive_integer(kv_state_bytes, "kv_state_bytes")
+    payload = _number(kv_state_bytes, "kv_state_bytes", positive=True)
     bandwidth, latency_us, efficiency, max_concurrent = _validated_link_values(
         pd_link
     )
