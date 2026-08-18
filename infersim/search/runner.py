@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
 import hashlib
 import json
+from math import isfinite
+from numbers import Real
 import re
+from types import MappingProxyType
 
 from infersim.errors import InputValidationError
 from infersim.schema.hardware import HardwareSpec
 from infersim.schema.model import ModelSpec
 from infersim.schema.parallel import PlanValidation, SearchSpace
 from infersim.schema.precision import PrecisionSpec
-from infersim.schema.scenario import ScenarioSet
+from infersim.schema.scenario import ScenarioSet, WorkloadScenario
 from infersim.search.constraints import (
     StageCandidate,
     evaluate_stage_constraints,
@@ -46,6 +49,121 @@ class CandidateDiagnostic:
                 raise InputValidationError(field, "must be a non-empty string")
 
 
+def _snapshot_scenarios(value: ScenarioSet) -> ScenarioSet:
+    path = "context.scenario_set"
+    if value.policy not in ("all", "weighted"):
+        raise InputValidationError(
+            f"{path}.policy", "must be 'all' or 'weighted'"
+        )
+    scenarios = value.scenarios
+    if isinstance(scenarios, (str, bytes, bytearray)) or not isinstance(
+        scenarios, Sequence
+    ):
+        raise InputValidationError(f"{path}.scenarios", "must be a sequence")
+    if not scenarios:
+        raise InputValidationError(f"{path}.scenarios", "must not be empty")
+    snapshot = tuple(scenarios)
+    names = set()
+    for index, scenario in enumerate(snapshot):
+        if not isinstance(scenario, WorkloadScenario):
+            raise InputValidationError(
+                f"{path}.scenarios[{index}]", "must be a WorkloadScenario"
+            )
+        if scenario.name in names:
+            raise InputValidationError(
+                f"{path}.scenarios[{index}].name", "must be unique"
+            )
+        names.add(scenario.name)
+    return replace(value, scenarios=snapshot)
+
+
+def _snapshot_search_space(value: SearchSpace) -> SearchSpace:
+    axes = {}
+    for axis in (
+        "total_cards",
+        "replicas",
+        "attention_tp",
+        "attention_dp",
+        "moe_tp",
+        "expert_parallel",
+        "batch_sizes",
+    ):
+        path = f"context.search_space.{axis}"
+        raw_values = getattr(value, axis)
+        if isinstance(raw_values, (str, bytes, bytearray)) or not isinstance(
+            raw_values, Sequence
+        ):
+            raise InputValidationError(path, "must be a sequence")
+        if not raw_values:
+            raise InputValidationError(path, "must not be empty")
+        seen = set()
+        normalized = []
+        for index, item in enumerate(raw_values):
+            item_path = f"{path}[{index}]"
+            if type(item) is not int:
+                raise InputValidationError(item_path, "must be an integer")
+            if item <= 0:
+                raise InputValidationError(item_path, "must be positive")
+            if item in seen:
+                raise InputValidationError(
+                    item_path, "must not contain duplicates"
+                )
+            seen.add(item)
+            normalized.append(item)
+        axes[axis] = tuple(sorted(normalized))
+    return replace(value, **axes)
+
+
+def _snapshot_performance(value, path: str):
+    if not isinstance(value, Mapping):
+        raise InputValidationError(path, "must be a mapping")
+    if not value:
+        raise InputValidationError(path, "must not be empty")
+    normalized = {}
+    for mode, throughput in value.items():
+        if not isinstance(mode, str) or not mode:
+            raise InputValidationError(path, "mode names must be non-empty strings")
+        value_path = f"{path}.{mode}"
+        if isinstance(throughput, bool) or not isinstance(throughput, Real):
+            raise InputValidationError(value_path, "must be a number")
+        normalized_throughput = float(throughput)
+        if not isfinite(normalized_throughput):
+            raise InputValidationError(value_path, "must be finite")
+        if normalized_throughput <= 0:
+            raise InputValidationError(value_path, "must be positive")
+        normalized[mode] = normalized_throughput
+    return MappingProxyType(dict(sorted(normalized.items())))
+
+
+def _snapshot_hardware(value: HardwareSpec) -> HardwareSpec:
+    tile = value.gemm_tile
+    path = "context.hardware.gemm_tile"
+    if isinstance(tile, (str, bytes, bytearray)) or not isinstance(
+        tile, Sequence
+    ):
+        raise InputValidationError(path, "must be a sequence")
+    if len(tile) != 3:
+        raise InputValidationError(path, "must contain exactly three dimensions")
+    normalized_tile = []
+    for index, dimension in enumerate(tile):
+        dimension_path = f"{path}[{index}]"
+        if type(dimension) is not int:
+            raise InputValidationError(dimension_path, "must be an integer")
+        if dimension <= 0:
+            raise InputValidationError(dimension_path, "must be positive")
+        normalized_tile.append(dimension)
+    return replace(
+        value,
+        gemm_tflops=_snapshot_performance(
+            value.gemm_tflops, "context.hardware.gemm_tflops"
+        ),
+        vector_tflops=_snapshot_performance(
+            value.vector_tflops, "context.hardware.vector_tflops"
+        ),
+        gemm_tile=tuple(normalized_tile),
+    )
+
+
 @dataclass(frozen=True)
 class SearchContext:
     model: ModelSpec
@@ -57,11 +175,11 @@ class SearchContext:
 
     def __post_init__(self) -> None:
         for path, value, expected in (
-            ("model", self.model, ModelSpec),
-            ("hardware", self.hardware, HardwareSpec),
-            ("precision", self.precision, PrecisionSpec),
-            ("scenario_set", self.scenario_set, ScenarioSet),
-            ("search_space", self.search_space, SearchSpace),
+            ("context.model", self.model, ModelSpec),
+            ("context.hardware", self.hardware, HardwareSpec),
+            ("context.precision", self.precision, PrecisionSpec),
+            ("context.scenario_set", self.scenario_set, ScenarioSet),
+            ("context.search_space", self.search_space, SearchSpace),
         ):
             if not isinstance(value, expected):
                 raise InputValidationError(
@@ -70,13 +188,23 @@ class SearchContext:
         if isinstance(self.assumptions, (str, bytes, bytearray)) or not isinstance(
             self.assumptions, Sequence
         ):
-            raise InputValidationError("assumptions", "must be a sequence")
+            raise InputValidationError(
+                "context.assumptions", "must be a sequence"
+            )
         assumptions = tuple(self.assumptions)
         for index, assumption in enumerate(assumptions):
             if not isinstance(assumption, str) or not assumption:
                 raise InputValidationError(
-                    f"assumptions[{index}]", "must be a non-empty string"
+                    f"context.assumptions[{index}]",
+                    "must be a non-empty string",
                 )
+        object.__setattr__(self, "hardware", _snapshot_hardware(self.hardware))
+        object.__setattr__(
+            self, "scenario_set", _snapshot_scenarios(self.scenario_set)
+        )
+        object.__setattr__(
+            self, "search_space", _snapshot_search_space(self.search_space)
+        )
         object.__setattr__(self, "assumptions", assumptions)
 
 
@@ -387,6 +515,19 @@ def run_stage_search(
     _require_type(precision, PrecisionSpec, "precision")
     _require_type(scenario_set, ScenarioSet, "scenario_set")
     _require_type(search_space, SearchSpace, "search_space")
+    context = SearchContext(
+        model=model,
+        hardware=hardware,
+        precision=precision,
+        scenario_set=scenario_set,
+        search_space=search_space,
+        assumptions=_ASSUMPTIONS,
+    )
+    model = context.model
+    hardware = context.hardware
+    precision = context.precision
+    scenario_set = context.scenario_set
+    search_space = context.search_space
     precision.validate_hardware(hardware)
 
     validations = tuple(enumerate_plans(model, search_space))
@@ -497,12 +638,5 @@ def run_stage_search(
                 ),
             )
         ),
-        context=SearchContext(
-            model=model,
-            hardware=hardware,
-            precision=precision,
-            scenario_set=scenario_set,
-            search_space=search_space,
-            assumptions=_ASSUMPTIONS,
-        ),
+        context=context,
     )

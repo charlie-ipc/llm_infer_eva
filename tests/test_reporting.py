@@ -13,7 +13,8 @@ from unittest.mock import patch
 import infersim.report as report_module
 from infersim.errors import InputValidationError
 from infersim.report import CSV_FIELDS, write_stage_reports
-from infersim.schema.parallel import PlanValidation
+from infersim.schema.parallel import PlanValidation, SearchSpace
+from infersim.schema.scenario import ScenarioSet
 from infersim.search import (
     CandidateDiagnostic,
     SearchContext,
@@ -105,6 +106,59 @@ class SearchResultTests(unittest.TestCase):
             diagnostic.detail = "changed"
         with self.assertRaises(FrozenInstanceError):
             context.model = make_dense_model()
+
+    def test_context_rejects_invalid_nested_values_with_exact_paths(self):
+        defaults = {
+            "model": make_dense_model(),
+            "hardware": make_hardware(),
+            "precision": make_w4a8_precision(),
+            "scenario_set": make_scenario_set(),
+            "search_space": make_search_space(),
+            "assumptions": ("assumption",),
+        }
+        cases = (
+            (
+                {"scenario_set": ScenarioSet("all", [object()])},
+                "context.scenario_set.scenarios[0]",
+            ),
+            (
+                {
+                    "search_space": replace(
+                        make_search_space(), attention_tp=[True]
+                    )
+                },
+                "context.search_space.attention_tp[0]",
+            ),
+            (
+                {
+                    "search_space": replace(
+                        make_search_space(), attention_tp=[1, 1]
+                    )
+                },
+                "context.search_space.attention_tp[1]",
+            ),
+            (
+                {
+                    "hardware": replace(
+                        make_hardware(), gemm_tflops={"w4a8": "bad"}
+                    )
+                },
+                "context.hardware.gemm_tflops.w4a8",
+            ),
+            (
+                {
+                    "hardware": replace(
+                        make_hardware(), gemm_tile=[128, object(), 64]
+                    )
+                },
+                "context.hardware.gemm_tile[1]",
+            ),
+        )
+        for override, path in cases:
+            with self.subTest(path=path):
+                with self.assertRaises(InputValidationError) as caught:
+                    SearchContext(**(defaults | override))
+                self.assertEqual(caught.exception.path, path)
 
     def test_rejects_wrong_types_stages_and_inconsistent_subsets(self):
         prefill = make_candidate(candidate_id="prefill")
@@ -269,10 +323,13 @@ class RunnerTests(unittest.TestCase):
         result = run_stage_search(**inputs)
 
         self.assertIs(result.context.model, inputs["model"])
-        self.assertIs(result.context.hardware, inputs["hardware"])
         self.assertIs(result.context.precision, inputs["precision"])
-        self.assertIs(result.context.scenario_set, inputs["scenario_set"])
-        self.assertIs(result.context.search_space, inputs["search_space"])
+        self.assertEqual(result.context.hardware, inputs["hardware"])
+        self.assertEqual(result.context.scenario_set, inputs["scenario_set"])
+        self.assertEqual(result.context.search_space, inputs["search_space"])
+        self.assertIsNot(result.context.hardware, inputs["hardware"])
+        self.assertIsNot(result.context.scenario_set, inputs["scenario_set"])
+        self.assertIsNot(result.context.search_space, inputs["search_space"])
         self.assertTrue(
             any("no P99 queueing" in item for item in result.context.assumptions)
         )
@@ -373,6 +430,66 @@ class RunnerTests(unittest.TestCase):
 
         self.assertEqual(before, {name: repr(value) for name, value in inputs.items()})
         self.assertEqual(result.candidates[0].hourly_cost, 1.25)
+
+    def test_search_context_snapshots_mutable_normalized_containers(self):
+        scenario_values = [make_scenario(concurrency=2)]
+        scenario_set = ScenarioSet("all", scenario_values)
+        axes = {
+            "total_cards": [1],
+            "replicas": [1],
+            "attention_tp": [1],
+            "attention_dp": [1],
+            "moe_tp": [1],
+            "expert_parallel": [1],
+            "batch_sizes": [2],
+        }
+        search_space = SearchSpace(**axes)
+        base_hardware = make_hardware()
+        gemm_tflops = dict(base_hardware.gemm_tflops)
+        vector_tflops = dict(base_hardware.vector_tflops)
+        gemm_tile = list(base_hardware.gemm_tile)
+        hardware = replace(
+            base_hardware,
+            gemm_tflops=gemm_tflops,
+            vector_tflops=vector_tflops,
+            gemm_tile=gemm_tile,
+        )
+
+        result = run_stage_search(
+            "prefill",
+            make_dense_model(),
+            hardware,
+            make_w4a8_precision(),
+            scenario_set,
+            search_space,
+        )
+        with tempfile.TemporaryDirectory() as before_dir:
+            write_stage_reports(Path(before_dir), result)
+            before = {
+                path.name: path.read_bytes() for path in Path(before_dir).iterdir()
+            }
+
+        scenario_values.append(make_scenario(name="later", concurrency=2))
+        axes["batch_sizes"].append(4)
+        gemm_tflops["w4a8"] = 1
+        vector_tflops["int8"] = 1
+        gemm_tile[0] = 1
+
+        context = result.context
+        self.assertEqual(context.scenario_set.scenarios, (scenario_values[0],))
+        self.assertEqual(context.search_space.batch_sizes, (2,))
+        self.assertEqual(context.hardware.gemm_tflops["w4a8"], 900.0)
+        self.assertEqual(context.hardware.vector_tflops["int8"], 120.0)
+        self.assertEqual(context.hardware.gemm_tile, (128, 128, 64))
+        with self.assertRaises(TypeError):
+            context.hardware.gemm_tflops["w4a8"] = 2
+
+        with tempfile.TemporaryDirectory() as after_dir:
+            write_stage_reports(Path(after_dir), result)
+            after = {
+                path.name: path.read_bytes() for path in Path(after_dir).iterdir()
+            }
+        self.assertEqual(after, before)
 
     def test_oom_has_no_feasible_plan_and_stable_dominant_reason(self):
         inputs = self.inputs(
