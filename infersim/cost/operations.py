@@ -5,7 +5,7 @@ from numbers import Real
 from infersim.errors import InputValidationError
 from infersim.schema.model import ModelSpec
 from infersim.schema.parallel import ParallelPlan
-from infersim.search import validate_plan
+from infersim.search.enumerate import validate_plan
 
 
 def _name(value: object, path: str) -> str:

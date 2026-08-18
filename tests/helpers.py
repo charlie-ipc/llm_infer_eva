@@ -5,8 +5,13 @@ from infersim.schema.hardware import HardwareSpec
 from infersim.schema.model import ModelSpec
 from infersim.schema.parallel import ParallelPlan, SearchSpace
 from infersim.schema.precision import PrecisionSpec
-from infersim.schema.scenario import ScenarioSet, WorkloadScenario
-from infersim.search import StageCandidate
+from infersim.schema.scenario import PDLinkSpec, ScenarioSet, WorkloadScenario
+from infersim.search import (
+    SearchResult,
+    StageCandidate,
+    pareto_frontier,
+    recommend,
+)
 
 
 def make_hardware_dict(**overrides):
@@ -330,3 +335,106 @@ def make_stage_candidate(
 
 
 make_candidate = make_stage_candidate
+
+
+def make_prefill_candidate(
+    *,
+    candidate_id="prefill",
+    latency_ms=20.0,
+    request_capacity=100.0,
+    total_cards=1,
+    hourly_cost=None,
+    scenarios=None,
+):
+    plan = make_dense_plan(replicas=total_cards)
+    scenario_values = tuple(scenarios) if scenarios is not None else (
+        make_scenario(),
+    )
+    metrics = tuple(
+        make_metrics(
+            name=scenario.name,
+            stage="prefill",
+            ttft_ms=latency_ms,
+            request_capacity=request_capacity,
+            max_supported_concurrency=scenario.concurrency,
+            plan=plan,
+        )
+        for scenario in scenario_values
+    )
+    return make_stage_candidate(
+        candidate_id=candidate_id,
+        plan=plan,
+        metrics=metrics,
+        total_cards=total_cards,
+        hourly_cost=hourly_cost,
+        request_capacity=request_capacity,
+        request_capacity_per_card=request_capacity / total_cards,
+        ttft_ms=latency_ms,
+        scenarios=scenario_values,
+    )
+
+
+def make_decode_candidate(
+    *,
+    candidate_id="decode",
+    tpot_ms=5.0,
+    request_capacity=80.0,
+    total_cards=1,
+    hourly_cost=None,
+    scenarios=None,
+):
+    plan = make_dense_plan(replicas=total_cards)
+    scenario_values = tuple(scenarios) if scenarios is not None else (
+        make_scenario(),
+    )
+    metrics = tuple(
+        make_metrics(
+            name=scenario.name,
+            stage="decode",
+            tpot_ms=tpot_ms,
+            request_capacity=request_capacity,
+            max_supported_concurrency=scenario.concurrency,
+            plan=plan,
+        )
+        for scenario in scenario_values
+    )
+    return make_stage_candidate(
+        candidate_id=candidate_id,
+        plan=plan,
+        metrics=metrics,
+        total_cards=total_cards,
+        hourly_cost=hourly_cost,
+        request_capacity=request_capacity,
+        request_capacity_per_card=request_capacity / total_cards,
+        tpot_ms=tpot_ms,
+        scenarios=scenario_values,
+    )
+
+
+def make_pd_link(**overrides):
+    values = {
+        "bandwidth_gbps": 100.0,
+        "latency_us": 10.0,
+        "efficiency": 1.0,
+        "max_concurrent_transfers": 16,
+    }
+    values.update(deepcopy(overrides))
+    return PDLinkSpec.from_dict(values)
+
+
+def make_search_result(candidates, *, stage=None):
+    ordered = tuple(sorted(candidates, key=lambda item: item.candidate_id))
+    if stage is None:
+        stage = ordered[0].metrics[0].stage
+    feasible = tuple(candidate for candidate in ordered if candidate.feasible)
+    frontier = tuple(
+        sorted(pareto_frontier(ordered), key=lambda item: item.candidate_id)
+    )
+    return SearchResult(
+        stage=stage,
+        candidates=ordered,
+        feasible_candidates=feasible,
+        pareto_frontier=frontier,
+        recommendation=recommend(ordered),
+        dominant_rejection=None,
+    )

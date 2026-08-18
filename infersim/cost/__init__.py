@@ -15,6 +15,12 @@ from infersim.cost.memory import (
     kv_bytes_per_request,
     memory_breakdown,
 )
+from infersim.cost.pd import (
+    PDMetrics,
+    PDTransferMetrics,
+    evaluate_pd_pair,
+    pd_payload_bytes,
+)
 from infersim.cost.operations import (
     GemmShape,
     ModelCounts,
@@ -40,6 +46,8 @@ __all__ = [
     "KernelCost",
     "MemoryBreakdown",
     "ModelCounts",
+    "PDMetrics",
+    "PDTransferMetrics",
     "StageOperations",
     "StageMetrics",
     "VectorShape",
@@ -50,12 +58,14 @@ __all__ = [
     "evaluate_decode_scenarios",
     "evaluate_prefill",
     "evaluate_prefill_scenarios",
+    "evaluate_pd_pair",
     "kv_elements_per_token",
     "kv_bytes_per_request",
     "gemm_cost",
     "kernel_cost",
     "model_counts",
     "memory_breakdown",
+    "pd_payload_bytes",
     "recurrent_state_bytes",
     "recurrent_state_bytes_per_request",
     "stage_operations",

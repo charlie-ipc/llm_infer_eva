@@ -23,7 +23,7 @@ from infersim.schema.model import ModelSpec
 from infersim.schema.parallel import ParallelPlan
 from infersim.schema.precision import PrecisionSpec
 from infersim.schema.scenario import ScenarioSet, WorkloadScenario
-from infersim.search import validate_plan
+from infersim.search.enumerate import validate_plan
 
 
 def _finite_float(value: int | float, path: str) -> float:

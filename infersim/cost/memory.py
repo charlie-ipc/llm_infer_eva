@@ -11,7 +11,7 @@ from infersim.schema.hardware import HardwareSpec
 from infersim.schema.model import ModelSpec
 from infersim.schema.parallel import ParallelPlan
 from infersim.schema.precision import PrecisionSpec
-from infersim.search import validate_plan
+from infersim.search.enumerate import validate_plan
 
 
 _BIT_WIDTHS = frozenset({4, 8, 16, 32})
