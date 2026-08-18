@@ -8,9 +8,16 @@ from infersim.search.pareto import (
     recommend,
     recommendation_sort_key,
 )
-from infersim.search.runner import SearchResult, run_stage_search
+from infersim.search.runner import (
+    CandidateDiagnostic,
+    SearchContext,
+    SearchResult,
+    run_stage_search,
+)
 
 __all__ = [
+    "CandidateDiagnostic",
+    "SearchContext",
     "StageCandidate",
     "SearchResult",
     "enumerate_plans",

@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import csv
-from dataclasses import fields
+from collections.abc import Mapping
+from dataclasses import fields, is_dataclass
+import io
 import json
 from math import isfinite
+from numbers import Real
+import os
 from pathlib import Path
+import tempfile
 
 from infersim.errors import InputValidationError
 from infersim.search.constraints import StageCandidate
-from infersim.search.runner import SearchResult, _rank_rejections
+from infersim.search.runner import SearchResult, _base_reason, _rank_rejections
 
 
 CSV_FIELDS = (
@@ -16,6 +21,7 @@ CSV_FIELDS = (
     "stage",
     "feasible",
     "reason_codes",
+    "reason_details",
     "warning_codes",
     "total_cards",
     "hourly_cost",
@@ -31,6 +37,12 @@ CSV_FIELDS = (
     "batch_size",
     "scenario_count",
     "worst_latency_seconds",
+    "worst_gemm_seconds",
+    "worst_vector_seconds",
+    "worst_tp_seconds",
+    "worst_ep_seconds",
+    "prompt_token_capacity",
+    "output_token_capacity",
     "worst_memory_required_bytes",
     "worst_memory_margin_bytes",
     "component_bottleneck",
@@ -38,6 +50,8 @@ CSV_FIELDS = (
 
 
 def _finite(value: int | float, path: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise InputValidationError(path, "must be a number")
     try:
         normalized = float(value)
     except (TypeError, ValueError, OverflowError):
@@ -45,6 +59,16 @@ def _finite(value: int | float, path: str) -> float:
     if not isfinite(normalized):
         raise InputValidationError(path, "must be finite")
     return normalized
+
+
+def _nonnegative_integer(value, path: str, *, optional: bool = False):
+    if optional and value is None:
+        return None
+    if type(value) is not int:
+        raise InputValidationError(path, "must be an integer")
+    if value < 0:
+        raise InputValidationError(path, "must be nonnegative")
+    return value
 
 
 def _seconds(value: int | float, path: str) -> str:
@@ -81,7 +105,11 @@ def _component_bottleneck(candidate: StageCandidate) -> str | None:
     return min(component_totals, key=lambda name: (-component_totals[name], name))
 
 
-def _candidate_row(stage: str, candidate: StageCandidate) -> dict[str, str | int]:
+def _candidate_row(
+    stage: str,
+    candidate: StageCandidate,
+    reason_details: tuple[str, ...] = (),
+) -> dict[str, str | int]:
     plan = candidate.plan
     metrics = candidate.metrics
     worst_latency = max(
@@ -93,11 +121,37 @@ def _candidate_row(stage: str, candidate: StageCandidate) -> dict[str, str | int
     worst_margin = min(
         (metric.memory.capacity_margin_bytes for metric in metrics), default=None
     )
+    component_values = {
+        name: max((getattr(metric, name) for metric in metrics), default=None)
+        for name in (
+            "gemm_seconds",
+            "vector_seconds",
+            "tp_seconds",
+            "ep_seconds",
+        )
+    }
+    prompt_capacity = min(
+        (
+            metric.prompt_token_capacity
+            for metric in metrics
+            if metric.prompt_token_capacity is not None
+        ),
+        default=None,
+    )
+    output_capacity = min(
+        (
+            metric.output_token_capacity
+            for metric in metrics
+            if metric.output_token_capacity is not None
+        ),
+        default=None,
+    )
     return {
         "candidate_id": candidate.candidate_id,
         "stage": stage,
         "feasible": "true" if candidate.feasible else "false",
         "reason_codes": ";".join(candidate.reason_codes),
+        "reason_details": ";".join(reason_details),
         "warning_codes": ";".join(candidate.warnings),
         "total_cards": candidate.total_cards,
         "hourly_cost": _six(candidate.hourly_cost, "hourly_cost"),
@@ -117,6 +171,26 @@ def _candidate_row(stage: str, candidate: StageCandidate) -> dict[str, str | int
         "worst_latency_seconds": ""
         if worst_latency is None
         else _seconds(worst_latency, "worst_latency_seconds"),
+        "worst_gemm_seconds": ""
+        if component_values["gemm_seconds"] is None
+        else _seconds(component_values["gemm_seconds"], "worst_gemm_seconds"),
+        "worst_vector_seconds": ""
+        if component_values["vector_seconds"] is None
+        else _seconds(
+            component_values["vector_seconds"], "worst_vector_seconds"
+        ),
+        "worst_tp_seconds": ""
+        if component_values["tp_seconds"] is None
+        else _seconds(component_values["tp_seconds"], "worst_tp_seconds"),
+        "worst_ep_seconds": ""
+        if component_values["ep_seconds"] is None
+        else _seconds(component_values["ep_seconds"], "worst_ep_seconds"),
+        "prompt_token_capacity": _six(
+            prompt_capacity, "prompt_token_capacity"
+        ),
+        "output_token_capacity": _six(
+            output_capacity, "output_token_capacity"
+        ),
         "worst_memory_required_bytes": ""
         if worst_required is None
         else _bytes(worst_required, "worst_memory_required_bytes"),
@@ -136,6 +210,96 @@ def _memory_payload(memory, path: str) -> dict:
             round(_finite(getattr(memory, field.name), f"{path}.{field.name}"))
         )
     return payload
+
+
+def _validate_metric(metric, path: str) -> None:
+    for field_name in (
+        "latency_seconds",
+        "average_context_length",
+        "gemm_seconds",
+        "vector_seconds",
+        "tp_seconds",
+        "ep_seconds",
+        "request_capacity",
+    ):
+        _finite(getattr(metric, field_name), f"{path}.{field_name}")
+    for field_name in (
+        "tpot_seconds",
+        "prompt_token_capacity",
+        "output_token_capacity",
+    ):
+        value = getattr(metric, field_name)
+        if value is not None:
+            _finite(value, f"{path}.{field_name}")
+    for field_name in (
+        "useful_gemm_ops",
+        "aligned_gemm_ops",
+        "useful_vector_ops",
+        "aligned_vector_ops",
+    ):
+        _nonnegative_integer(
+            getattr(metric, field_name), f"{path}.{field_name}"
+        )
+    for field_name in ("max_supported_batch", "max_supported_concurrency"):
+        _nonnegative_integer(
+            getattr(metric, field_name),
+            f"{path}.{field_name}",
+            optional=True,
+        )
+    for component_name, seconds in metric.component_seconds.items():
+        if not isinstance(component_name, str) or not component_name:
+            raise InputValidationError(
+                f"{path}.component_seconds", "keys must be non-empty strings"
+            )
+        _finite(seconds, f"{path}.component_seconds.{component_name}")
+    if type(metric.memory.feasible) is not bool:
+        raise InputValidationError(
+            f"{path}.memory.feasible", "must be a boolean"
+        )
+    for field in fields(metric.memory):
+        if field.name in ("stage", "feasible"):
+            continue
+        value = _finite(
+            getattr(metric.memory, field.name),
+            f"{path}.memory.{field.name}",
+        )
+        if field.name != "capacity_margin_bytes" and value < 0:
+            raise InputValidationError(
+                f"{path}.memory.{field.name}", "must be nonnegative"
+            )
+
+
+def _validate_result_numbers(result: SearchResult) -> None:
+    for candidate_index, candidate in enumerate(result.candidates):
+        path = f"candidates[{candidate_index}]"
+        for field_name in (
+            "replicas",
+            "attention_tp",
+            "attention_dp",
+            "moe_tp",
+            "expert_parallel",
+            "batch_size",
+        ):
+            value = _nonnegative_integer(
+                getattr(candidate.plan, field_name), f"{path}.plan.{field_name}"
+            )
+            if value == 0:
+                raise InputValidationError(
+                    f"{path}.plan.{field_name}", "must be positive"
+                )
+        _nonnegative_integer(candidate.total_cards, f"{path}.total_cards")
+        for field_name in (
+            "request_capacity",
+            "request_capacity_per_card",
+            "ttft_ms",
+            "tpot_ms",
+            "hourly_cost",
+        ):
+            value = getattr(candidate, field_name)
+            if value is not None:
+                _finite(value, f"{path}.{field_name}")
+        for metric_index, metric in enumerate(candidate.metrics):
+            _validate_metric(metric, f"{path}.metrics[{metric_index}]")
 
 
 def _metric_payload(metric, index: int) -> dict:
@@ -221,12 +385,87 @@ def _candidate_payload(stage: str, candidate: StageCandidate) -> dict:
     }
 
 
-def _write_csv(path: Path, stage: str, candidates) -> None:
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
-        writer.writeheader()
-        for candidate in sorted(candidates, key=lambda item: item.candidate_id):
-            writer.writerow(_candidate_row(stage, candidate))
+def _csv_content(stage: str, candidates, diagnostic_details) -> str:
+    handle = io.StringIO(newline="")
+    writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
+    writer.writeheader()
+    for candidate in sorted(candidates, key=lambda item: item.candidate_id):
+        writer.writerow(
+            _candidate_row(
+                stage,
+                candidate,
+                diagnostic_details.get(candidate.candidate_id, ()),
+            )
+        )
+    return handle.getvalue()
+
+
+def _normalized_value(value, path: str):
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            field.name: _normalized_value(
+                getattr(value, field.name), f"{path}.{field.name}"
+            )
+            for field in fields(value)
+        }
+    if isinstance(value, Mapping):
+        for key in value:
+            if not isinstance(key, str) or not key:
+                raise InputValidationError(path, "keys must be non-empty strings")
+        return {
+            key: _normalized_value(item, f"{path}.{key}")
+            for key, item in sorted(value.items())
+        }
+    if isinstance(value, tuple):
+        return [
+            _normalized_value(item, f"{path}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    if isinstance(value, float):
+        return _finite(value, path)
+    if isinstance(value, bool) or value is None or isinstance(value, str):
+        return value
+    if type(value) is int:
+        return value
+    raise InputValidationError(path, "contains an unsupported value")
+    return value
+
+
+def _normalized_input_summary(result: SearchResult):
+    context = result.context
+    if context is None:
+        return None
+    return {
+        "hardware": _normalized_value(context.hardware, "context.hardware"),
+        "model": _normalized_value(context.model, "context.model"),
+        "precision": _normalized_value(context.precision, "context.precision"),
+        "scenario_set": _normalized_value(
+            context.scenario_set, "context.scenario_set"
+        ),
+        "search_space": _normalized_value(
+            context.search_space, "context.search_space"
+        ),
+    }
+
+
+def _diagnostic_details(result: SearchResult):
+    values = {}
+    for diagnostic in result.diagnostics:
+        values.setdefault(diagnostic.candidate_id, []).append(diagnostic.detail)
+    return {
+        candidate_id: tuple(details)
+        for candidate_id, details in sorted(values.items())
+    }
+
+
+def _rejection_details(result: SearchResult, base_reason: str) -> list[str]:
+    return sorted(
+        {
+            diagnostic.detail
+            for diagnostic in result.diagnostics
+            if _base_reason(diagnostic.reason_code) == base_reason
+        }
+    )
 
 
 def _summary(result: SearchResult, rejection_ranking) -> str:
@@ -258,11 +497,113 @@ def _summary(result: SearchResult, rejection_ranking) -> str:
     lines.append("Top rejection reasons:")
     if rejection_ranking:
         lines.extend(
-            f"{reason}: {count}" for reason, count in rejection_ranking[:3]
+            f"{reason}: {count} | "
+            + "; ".join(_rejection_details(result, reason))
+            for reason, count in rejection_ranking[:3]
         )
     else:
         lines.append("none")
     return "\n".join(lines) + "\n"
+
+
+def _report_contents(result: SearchResult) -> dict[str, str]:
+    _validate_result_numbers(result)
+    diagnostic_details = _diagnostic_details(result)
+    rejection_ranking = _rank_rejections(result.candidates)
+    payload = {
+        "assumptions": []
+        if result.context is None
+        else list(result.context.assumptions),
+        "dominant_rejection": result.dominant_rejection,
+        "normalized_input_summary": _normalized_input_summary(result),
+        "recommendation": None
+        if result.recommendation is None
+        else _candidate_payload(result.stage, result.recommendation),
+        "stage": result.stage,
+        "top_rejection_reasons": [
+            {
+                "count": count,
+                "details": _rejection_details(result, reason),
+                "reason": reason,
+            }
+            for reason, count in rejection_ranking[:3]
+        ],
+    }
+    json_content = json.dumps(
+        payload,
+        sort_keys=True,
+        indent=2,
+        allow_nan=False,
+    ) + "\n"
+    return {
+        "all_candidates.csv": _csv_content(
+            result.stage, result.candidates, diagnostic_details
+        ),
+        "feasible_candidates.csv": _csv_content(
+            result.stage, result.feasible_candidates, diagnostic_details
+        ),
+        "pareto_frontier.csv": _csv_content(
+            result.stage, result.pareto_frontier, diagnostic_details
+        ),
+        "recommendation.json": json_content,
+        "summary.txt": _summary(result, rejection_ranking),
+    }
+
+
+def _temporary_file(output_dir: Path, name: str, content: str | bytes) -> Path:
+    descriptor, raw_path = tempfile.mkstemp(
+        dir=output_dir,
+        prefix=f".{name}.",
+        suffix=".tmp",
+    )
+    path = Path(raw_path)
+    try:
+        if isinstance(content, bytes):
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(content)
+        else:
+            with os.fdopen(
+                descriptor, "w", encoding="utf-8", newline=""
+            ) as handle:
+                handle.write(content)
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    return path
+
+
+def _replace_reports(output_dir: Path, contents: Mapping[str, str]) -> None:
+    originals = {
+        name: (output_dir / name).read_bytes()
+        if (output_dir / name).exists()
+        else None
+        for name in contents
+    }
+    temporary = {}
+    replaced = []
+    try:
+        for name, content in contents.items():
+            temporary[name] = _temporary_file(output_dir, name, content)
+        for name in contents:
+            os.replace(temporary[name], output_dir / name)
+            replaced.append(name)
+        temporary.clear()
+    except BaseException:
+        for name in reversed(replaced):
+            target = output_dir / name
+            original = originals[name]
+            if original is None:
+                target.unlink(missing_ok=True)
+            else:
+                restore = _temporary_file(output_dir, name, original)
+                try:
+                    os.replace(restore, target)
+                finally:
+                    restore.unlink(missing_ok=True)
+        raise
+    finally:
+        for path in temporary.values():
+            path.unlink(missing_ok=True)
 
 
 def write_stage_reports(output_dir: Path, result: SearchResult) -> None:
@@ -270,34 +611,6 @@ def write_stage_reports(output_dir: Path, result: SearchResult) -> None:
         raise InputValidationError("output_dir", "must be a Path")
     if not isinstance(result, SearchResult):
         raise InputValidationError("result", "must be a SearchResult")
+    contents = _report_contents(result)
     output_dir.mkdir(parents=True, exist_ok=True)
-    _write_csv(output_dir / "all_candidates.csv", result.stage, result.candidates)
-    _write_csv(
-        output_dir / "feasible_candidates.csv",
-        result.stage,
-        result.feasible_candidates,
-    )
-    _write_csv(
-        output_dir / "pareto_frontier.csv", result.stage, result.pareto_frontier
-    )
-
-    rejection_ranking = _rank_rejections(result.candidates)
-    payload = {
-        "dominant_rejection": result.dominant_rejection,
-        "recommendation": None
-        if result.recommendation is None
-        else _candidate_payload(result.stage, result.recommendation),
-        "stage": result.stage,
-        "top_rejection_reasons": [
-            {"count": count, "reason": reason}
-            for reason, count in rejection_ranking[:3]
-        ],
-    }
-    with (output_dir / "recommendation.json").open(
-        "w", encoding="utf-8", newline="\n"
-    ) as handle:
-        json.dump(payload, handle, sort_keys=True, indent=2, allow_nan=False)
-        handle.write("\n")
-    (output_dir / "summary.txt").write_text(
-        _summary(result, rejection_ranking), encoding="utf-8", newline="\n"
-    )
+    _replace_reports(output_dir, contents)

@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
+import hashlib
+import json
 import re
 
 from infersim.errors import InputValidationError
@@ -18,6 +20,64 @@ from infersim.search.constraints import (
 from infersim.search.enumerate import enumerate_plans
 from infersim.search.pareto import pareto_frontier as find_pareto_frontier
 from infersim.search.pareto import recommend
+
+
+_ASSUMPTIONS = (
+    "Analytical grid search; no P99 queueing model.",
+    "Prefill and decode stages are evaluated independently.",
+    "Kernel time uses tiled roofline compute and memory costs.",
+    "Collective time uses configured topology bandwidth and latency.",
+)
+
+
+@dataclass(frozen=True)
+class CandidateDiagnostic:
+    candidate_id: str
+    reason_code: str
+    detail: str
+
+    def __post_init__(self) -> None:
+        for field, value in (
+            ("candidate_id", self.candidate_id),
+            ("reason_code", self.reason_code),
+            ("detail", self.detail),
+        ):
+            if not isinstance(value, str) or not value:
+                raise InputValidationError(field, "must be a non-empty string")
+
+
+@dataclass(frozen=True)
+class SearchContext:
+    model: ModelSpec
+    hardware: HardwareSpec
+    precision: PrecisionSpec
+    scenario_set: ScenarioSet
+    search_space: SearchSpace
+    assumptions: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        for path, value, expected in (
+            ("model", self.model, ModelSpec),
+            ("hardware", self.hardware, HardwareSpec),
+            ("precision", self.precision, PrecisionSpec),
+            ("scenario_set", self.scenario_set, ScenarioSet),
+            ("search_space", self.search_space, SearchSpace),
+        ):
+            if not isinstance(value, expected):
+                raise InputValidationError(
+                    path, f"must be a {expected.__name__}"
+                )
+        if isinstance(self.assumptions, (str, bytes, bytearray)) or not isinstance(
+            self.assumptions, Sequence
+        ):
+            raise InputValidationError("assumptions", "must be a sequence")
+        assumptions = tuple(self.assumptions)
+        for index, assumption in enumerate(assumptions):
+            if not isinstance(assumption, str) or not assumption:
+                raise InputValidationError(
+                    f"assumptions[{index}]", "must be a non-empty string"
+                )
+        object.__setattr__(self, "assumptions", assumptions)
 
 
 def evaluate_prefill(*args, **kwargs):
@@ -58,6 +118,8 @@ class SearchResult:
     pareto_frontier: tuple[StageCandidate, ...]
     recommendation: StageCandidate | None
     dominant_rejection: str | None
+    diagnostics: tuple[CandidateDiagnostic, ...] = ()
+    context: SearchContext | None = None
 
     def __post_init__(self) -> None:
         if self.stage not in ("prefill", "decode"):
@@ -83,6 +145,12 @@ class SearchResult:
                         f"candidates[{index}].metrics[{metric_index}].stage",
                         "must equal result stage",
                     )
+        if candidates != tuple(
+            sorted(candidates, key=lambda item: item.candidate_id)
+        ):
+            raise InputValidationError(
+                "candidates", "must be sorted by candidate_id"
+            )
 
         for path, values in (
             ("feasible_candidates", feasible),
@@ -98,6 +166,26 @@ class SearchResult:
                         f"{path}[{index}]", "must also be in candidates"
                     )
 
+        expected_feasible = tuple(
+            candidate for candidate in candidates if candidate.feasible
+        )
+        if feasible != expected_feasible:
+            raise InputValidationError(
+                "feasible_candidates",
+                "must exactly contain all feasible candidates",
+            )
+        expected_frontier = tuple(
+            sorted(
+                find_pareto_frontier(candidates),
+                key=lambda item: item.candidate_id,
+            )
+        )
+        if frontier != expected_frontier:
+            raise InputValidationError(
+                "pareto_frontier",
+                "must equal the deterministic candidate Pareto frontier",
+            )
+
         recommendation = self.recommendation
         if recommendation is not None:
             if not isinstance(recommendation, StageCandidate):
@@ -110,6 +198,11 @@ class SearchResult:
                 raise InputValidationError(
                     "recommendation", "must be a feasible candidate"
                 )
+        expected_recommendation = recommend(candidates)
+        if recommendation != expected_recommendation:
+            raise InputValidationError(
+                "recommendation", "must equal the deterministic recommendation"
+            )
         rejection = self.dominant_rejection
         if rejection is not None and (
             not isinstance(rejection, str) or not rejection
@@ -117,10 +210,81 @@ class SearchResult:
             raise InputValidationError(
                 "dominant_rejection", "must be a non-empty string or None"
             )
+        ranked_rejections = _rank_rejections(candidates)
+        expected_rejection = (
+            ranked_rejections[0][0] if ranked_rejections else None
+        )
+        if rejection != expected_rejection:
+            raise InputValidationError(
+                "dominant_rejection",
+                "must equal the dominant candidate rejection",
+            )
+        if isinstance(self.diagnostics, (str, bytes, bytearray)) or not isinstance(
+            self.diagnostics, Sequence
+        ):
+            raise InputValidationError("diagnostics", "must be a sequence")
+        diagnostics = tuple(self.diagnostics)
+        for index, diagnostic in enumerate(diagnostics):
+            if not isinstance(diagnostic, CandidateDiagnostic):
+                raise InputValidationError(
+                    f"diagnostics[{index}]", "must be a CandidateDiagnostic"
+                )
+        if diagnostics != tuple(
+            sorted(
+                diagnostics,
+                key=lambda item: (
+                    item.candidate_id,
+                    item.reason_code,
+                    item.detail,
+                ),
+            )
+        ):
+            raise InputValidationError(
+                "diagnostics", "must be sorted deterministically"
+            )
+        candidate_reasons = {
+            candidate.candidate_id: set(candidate.reason_codes)
+            for candidate in candidates
+            if not candidate.feasible
+        }
+        seen_diagnostic_reasons = set()
+        for index, diagnostic in enumerate(diagnostics):
+            if diagnostic.candidate_id not in candidate_reasons:
+                raise InputValidationError(
+                    f"diagnostics[{index}].candidate_id",
+                    "must identify an infeasible candidate",
+                )
+            if diagnostic.reason_code not in candidate_reasons[
+                diagnostic.candidate_id
+            ]:
+                raise InputValidationError(
+                    f"diagnostics[{index}].reason_code",
+                    "must identify a candidate rejection reason",
+                )
+            key = (diagnostic.candidate_id, diagnostic.reason_code)
+            if key in seen_diagnostic_reasons:
+                raise InputValidationError(
+                    f"diagnostics[{index}]", "must be unique"
+                )
+            seen_diagnostic_reasons.add(key)
+        expected_diagnostic_reasons = {
+            (candidate_id, reason_code)
+            for candidate_id, reason_codes in candidate_reasons.items()
+            for reason_code in reason_codes
+        }
+        if seen_diagnostic_reasons != expected_diagnostic_reasons:
+            raise InputValidationError(
+                "diagnostics", "must describe every candidate rejection"
+            )
+        if self.context is not None and not isinstance(self.context, SearchContext):
+            raise InputValidationError(
+                "context", "must be a SearchContext or None"
+            )
 
         object.__setattr__(self, "candidates", candidates)
         object.__setattr__(self, "feasible_candidates", feasible)
         object.__setattr__(self, "pareto_frontier", frontier)
+        object.__setattr__(self, "diagnostics", diagnostics)
 
 
 def _require_type(value, expected: type, path: str) -> None:
@@ -150,14 +314,34 @@ def _candidate_id(validation: PlanValidation) -> str:
         f"-mtp{plan.moe_tp}-ep{plan.expert_parallel}-b{plan.batch_size}"
     )
     if validation.feasible:
-        return identity + "-valid"
-    code = validation.reason_code or "INVALID_PLAN"
-    normalized_code = re.sub(r"[^a-z0-9]+", "-", code.lower()).strip("-")
-    return identity + "-invalid-" + (normalized_code or "invalid-plan")
+        readable_status = "valid"
+    else:
+        code = validation.reason_code or "INVALID_PLAN"
+        normalized_code = re.sub(r"[^a-z0-9]+", "-", code.lower()).strip("-")
+        readable_status = "invalid-" + (normalized_code or "invalid-plan")
+    canonical = json.dumps(_plan_key(validation), separators=(",", ":"))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
+    return f"{identity}-{readable_status}-{digest}"
 
 
 def _base_reason(code: str) -> str:
     return code.rsplit(":", 1)[-1]
+
+
+def _constraint_detail(reason_code: str) -> str:
+    scenario_name, separator, base_code = reason_code.rpartition(":")
+    if not separator:
+        scenario_name = "unknown"
+        base_code = reason_code
+    descriptions = {
+        "MEMORY_CAPACITY": "memory capacity exceeded",
+        "TTFT_SLO": "TTFT limit exceeded",
+        "TPOT_SLO": "TPOT limit exceeded",
+        "REQUEST_RATE": "request-rate capacity is insufficient",
+        "CONCURRENCY": "supported concurrency is insufficient",
+    }
+    description = descriptions.get(base_code, "constraint rejected")
+    return f"scenario '{scenario_name}': {description}"
 
 
 def _rank_rejections(
@@ -212,17 +396,19 @@ def run_stage_search(
                 f"validations[{index}]", "must be a PlanValidation"
             )
     sorted_validations = sorted(validations, key=_plan_key)
-    base_counts = Counter(_candidate_id(item) for item in sorted_validations)
-    seen = Counter()
+    occupied_ids = set()
     evaluator = evaluate_prefill if stage == "prefill" else evaluate_decode
     candidates = []
+    diagnostics = []
 
     for validation in sorted_validations:
         base_id = _candidate_id(validation)
-        seen[base_id] += 1
         candidate_id = base_id
-        if base_counts[base_id] > 1:
-            candidate_id += f"-n{seen[base_id]}"
+        suffix = 1
+        while candidate_id in occupied_ids:
+            candidate_id = f"{base_id}-n{suffix}"
+            suffix += 1
+        occupied_ids.add(candidate_id)
         plan = validation.plan
         hourly_cost = (
             None
@@ -244,6 +430,14 @@ def run_stage_search(
                 ttft_ms=None,
                 tpot_ms=None,
                 scenarios=(),
+            )
+            diagnostics.append(
+                CandidateDiagnostic(
+                    candidate_id,
+                    validation.reason_code or "INVALID_PLAN",
+                    validation.reason
+                    or f"plan rejected: {validation.reason_code or 'INVALID_PLAN'}",
+                )
             )
         else:
             metrics = tuple(
@@ -268,6 +462,14 @@ def run_stage_search(
             candidate = evaluate_stage_constraints(
                 raw_candidate, scenario_set.policy
             )
+            diagnostics.extend(
+                CandidateDiagnostic(
+                    candidate_id,
+                    reason_code,
+                    _constraint_detail(reason_code),
+                )
+                for reason_code in candidate.reason_codes
+            )
         candidates.append(candidate)
 
     ordered = tuple(sorted(candidates, key=lambda item: item.candidate_id))
@@ -285,4 +487,22 @@ def run_stage_search(
         pareto_frontier=frontier,
         recommendation=selected,
         dominant_rejection=dominant,
+        diagnostics=tuple(
+            sorted(
+                diagnostics,
+                key=lambda item: (
+                    item.candidate_id,
+                    item.reason_code,
+                    item.detail,
+                ),
+            )
+        ),
+        context=SearchContext(
+            model=model,
+            hardware=hardware,
+            precision=precision,
+            scenario_set=scenario_set,
+            search_space=search_space,
+            assumptions=_ASSUMPTIONS,
+        ),
     )
