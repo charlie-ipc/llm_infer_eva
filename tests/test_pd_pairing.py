@@ -1035,6 +1035,58 @@ class PDPairSearchTests(unittest.TestCase):
             replace(candidate, metrics=(rejected_metric,))
         self.assertEqual(caught.exception.path, "reason_codes")
 
+    def test_pd_candidate_rejects_feasible_phase_with_rejection_reasons(self):
+        result = pair_stage_results(
+            make_search_result((make_prefill_candidate(),)),
+            make_search_result((make_decode_candidate(),)),
+            make_pd_link(),
+            make_scenario_set(),
+            {"interactive": 1},
+        )
+        candidate = result.candidates[0]
+        for field, path in (
+            ("prefill_candidate", "prefill_candidate.reason_codes"),
+            ("decode_candidate", "decode_candidate.reason_codes"),
+        ):
+            phase = replace(
+                getattr(candidate, field),
+                feasible=True,
+                reason_codes=("interactive:MEMORY_CAPACITY",),
+            )
+            with self.subTest(field=field):
+                with self.assertRaises(InputValidationError) as caught:
+                    replace(candidate, **{field: phase})
+                self.assertEqual(caught.exception.path, path)
+
+    def test_pd_candidate_warnings_are_exact_stable_phase_metric_union(self):
+        prefill = replace(
+            make_prefill_candidate(), warnings=("prefill", "shared")
+        )
+        decode = replace(
+            make_decode_candidate(), warnings=("decode", "shared")
+        )
+        result = pair_stage_results(
+            make_search_result((prefill,)),
+            make_search_result((decode,)),
+            make_pd_link(),
+            make_scenario_set(),
+            {"interactive": 1},
+        )
+        candidate = result.candidates[0]
+        self.assertEqual(
+            candidate.warnings, ("prefill", "shared", "decode")
+        )
+
+        for warnings in (
+            ("prefill", "decode"),
+            ("decode", "shared", "prefill"),
+            ("prefill", "shared", "decode", "fabricated"),
+        ):
+            with self.subTest(warnings=warnings):
+                with self.assertRaises(InputValidationError) as caught:
+                    replace(candidate, warnings=warnings)
+                self.assertEqual(caught.exception.path, "warnings")
+
     def test_pd_result_rederives_link_scenario_and_metric_formulas(self):
         scenario = make_scenario(ttft_limit_ms=1000)
         result = pair_stage_results(

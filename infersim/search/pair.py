@@ -133,9 +133,17 @@ class PDCandidate:
             raise InputValidationError(
                 "prefill_candidate.feasible", "must be true"
             )
+        if self.prefill_candidate.reason_codes:
+            raise InputValidationError(
+                "prefill_candidate.reason_codes", "must be empty"
+            )
         if not self.decode_candidate.feasible:
             raise InputValidationError(
                 "decode_candidate.feasible", "must be true"
+            )
+        if self.decode_candidate.reason_codes:
+            raise InputValidationError(
+                "decode_candidate.reason_codes", "must be empty"
             )
         if self.prefill_candidate_id != self.prefill_candidate.candidate_id:
             raise InputValidationError(
@@ -184,6 +192,21 @@ class PDCandidate:
         if reasons != expected_reasons:
             raise InputValidationError(
                 "reason_codes", "must equal the metric rejection reasons"
+            )
+        expected_warnings = tuple(
+            dict.fromkeys(
+                self.prefill_candidate.warnings
+                + self.decode_candidate.warnings
+                + tuple(
+                    warning
+                    for metric in metrics
+                    for warning in metric.warnings
+                )
+            )
+        )
+        if warnings != expected_warnings:
+            raise InputValidationError(
+                "warnings", "must equal the phase and metric warnings"
             )
         if self.feasible != (not reasons):
             raise InputValidationError(
