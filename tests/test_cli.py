@@ -30,6 +30,13 @@ PD_REPORTS = {
     "recommendation.json",
     "summary.txt",
 }
+PAIR_MARKER = ".infersim-pd-output.json"
+PAIR_MARKER_BYTES = (
+    b'{\n'
+    b'  "format": "infersim-pd-output",\n'
+    b'  "version": 1\n'
+    b'}\n'
+)
 
 
 def hardware_fixture():
@@ -130,6 +137,22 @@ def tree_snapshot(root):
     )
 
 
+def make_owned_pair_output(root):
+    root.mkdir()
+    (root / PAIR_MARKER).write_bytes(PAIR_MARKER_BYTES)
+    for directory, report_names in (
+        ("prefill", STAGE_REPORTS),
+        ("decode", STAGE_REPORTS),
+        ("pd", PD_REPORTS),
+    ):
+        report_root = root / directory
+        report_root.mkdir()
+        for name in report_names:
+            (report_root / name).write_bytes(
+                f"old:{directory}/{name}".encode("ascii")
+            )
+
+
 def run_main(*arguments):
     stdout = io.StringIO()
     stderr = io.StringIO()
@@ -174,6 +197,11 @@ class SearchCliTests(unittest.TestCase):
             self.assertEqual(result.stderr, "")
             self.assertIn("PD pair:", result.stdout)
             self.assertIn("total cards:", result.stdout)
+            self.assertEqual(
+                {path.name for path in output.iterdir()},
+                {PAIR_MARKER, "prefill", "decode", "pd"},
+            )
+            self.assertEqual((output / PAIR_MARKER).read_bytes(), PAIR_MARKER_BYTES)
             self.assertEqual(
                 {path.name for path in (output / "prefill").iterdir()},
                 STAGE_REPORTS,
@@ -501,10 +529,7 @@ class SearchCliTests(unittest.TestCase):
             for index, failure in enumerate(failures):
                 with self.subTest(failure=failure):
                     output = parent / f"results-{index}"
-                    output.mkdir()
-                    (output / "old.txt").write_bytes(b"old root")
-                    (output / "nested").mkdir()
-                    (output / "nested" / "old.bin").write_bytes(b"old nested")
+                    make_owned_pair_output(output)
                     before = tree_snapshot(output)
 
                     with failure():
@@ -523,17 +548,19 @@ class SearchCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="infersim publish rollback ") as temporary:
             parent = Path(temporary)
             output = parent / "results"
-            output.mkdir()
-            (output / "old.txt").write_bytes(b"old")
+            make_owned_pair_output(output)
             before = tree_snapshot(output)
             real_replace = os.replace
             calls = 0
 
             def fail_second_replace(source, destination):
                 nonlocal calls
-                calls += 1
-                if calls == 2:
-                    raise OSError("injected publish failure")
+                source_path = Path(source)
+                destination_path = Path(destination)
+                if source_path == output or destination_path == output:
+                    calls += 1
+                    if calls == 2:
+                        raise OSError("injected publish failure")
                 return real_replace(source, destination)
 
             with patch("infersim.cli.os.replace", side_effect=fail_second_replace):
@@ -545,29 +572,159 @@ class SearchCliTests(unittest.TestCase):
             self.assertEqual(tree_snapshot(output), before)
             self.assertEqual({path.name for path in parent.iterdir()}, {"results"})
 
-    def test_pair_pd_success_replaces_the_owned_result_root_as_one_generation(self):
+    def test_pair_pd_rejects_an_unowned_nonempty_result_root(self):
         with tempfile.TemporaryDirectory(prefix="infersim publish success ") as temporary:
             parent = Path(temporary)
             output = parent / "results"
             output.mkdir()
             (output / "old.txt").write_bytes(b"old generation")
+            (output / ".git").mkdir()
+            before = tree_snapshot(output)
 
             result = run_cli(*pair_arguments(output))
 
-            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.stdout, "")
+            self.assertIn("not an owned InferSim PD output", result.stderr)
+            self.assertEqual(tree_snapshot(output), before)
+            self.assertEqual({path.name for path in parent.iterdir()}, {"results"})
+
+    def test_pair_pd_allows_empty_directory_and_exact_owned_rerun(self):
+        with tempfile.TemporaryDirectory(prefix="infersim publish rerun ") as temporary:
+            parent = Path(temporary)
+            output = parent / "results"
+            output.mkdir()
+
+            first = run_cli(*pair_arguments(output))
+            first_snapshot = tree_snapshot(output)
+            second = run_cli(*pair_arguments(output))
+
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertEqual(tree_snapshot(output), first_snapshot)
             self.assertEqual(
                 {path.name for path in output.iterdir()},
-                {"prefill", "decode", "pd"},
+                {PAIR_MARKER, "prefill", "decode", "pd"},
             )
-            self.assertFalse((output / "old.txt").exists())
             self.assertEqual({path.name for path in parent.iterdir()}, {"results"})
+
+    def test_pair_pd_rejects_corrupt_or_extended_owned_trees(self):
+        with tempfile.TemporaryDirectory(prefix="infersim ownership ") as temporary:
+            parent = Path(temporary)
+            cases = {
+                "extra-root": lambda root: (root / "notes.txt").write_text("keep"),
+                "extra-report": lambda root: (
+                    root / "prefill" / "private.txt"
+                ).write_text("keep"),
+                "corrupt-marker": lambda root: (root / PAIR_MARKER).write_text(
+                    '{"format":"wrong","version":1}', encoding="utf-8"
+                ),
+            }
+            for name, mutate in cases.items():
+                with self.subTest(name=name):
+                    output = parent / name
+                    make_owned_pair_output(output)
+                    mutate(output)
+                    before = tree_snapshot(output)
+
+                    result = run_cli(*pair_arguments(output))
+
+                    self.assertEqual(result.returncode, 2)
+                    self.assertEqual(result.stdout, "")
+                    self.assertIn("not an owned InferSim PD output", result.stderr)
+                    self.assertEqual(tree_snapshot(output), before)
+
+    def test_pair_pd_rejects_symlink_output_when_supported(self):
+        with tempfile.TemporaryDirectory(prefix="infersim ownership link ") as temporary:
+            parent = Path(temporary)
+            target = parent / "target"
+            output = parent / "results"
+            make_owned_pair_output(target)
+            before = tree_snapshot(target)
+            try:
+                os.symlink(target, output, target_is_directory=True)
+            except (OSError, NotImplementedError) as error:
+                self.skipTest(f"directory symlinks unavailable: {error}")
+
+            result = run_cli(*pair_arguments(output))
+
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.stdout, "")
+            self.assertIn("symlink", result.stderr)
+            self.assertTrue(output.is_symlink())
+            self.assertEqual(tree_snapshot(target), before)
+
+    def test_pair_pd_runtime_publish_failure_restores_old_tree_and_reraises(self):
+        with tempfile.TemporaryDirectory(prefix="infersim runtime rollback ") as temporary:
+            parent = Path(temporary)
+            output = parent / "results"
+            make_owned_pair_output(output)
+            before = tree_snapshot(output)
+            real_replace = os.replace
+            calls = 0
+
+            def fail_second_replace(source, destination):
+                nonlocal calls
+                source_path = Path(source)
+                destination_path = Path(destination)
+                if source_path == output or destination_path == output:
+                    calls += 1
+                    if calls == 2:
+                        raise RuntimeError("injected runtime publish failure")
+                return real_replace(source, destination)
+
+            with patch("infersim.cli.os.replace", side_effect=fail_second_replace):
+                with self.assertRaisesRegex(
+                    RuntimeError, "injected runtime publish failure"
+                ):
+                    run_main(*pair_arguments(output))
+
+            self.assertEqual(tree_snapshot(output), before)
+            self.assertEqual({path.name for path in parent.iterdir()}, {"results"})
+
+    def test_pair_pd_preserves_backup_when_rollback_itself_fails(self):
+        with tempfile.TemporaryDirectory(prefix="infersim failed rollback ") as temporary:
+            parent = Path(temporary)
+            output = parent / "results"
+            make_owned_pair_output(output)
+            before = tree_snapshot(output)
+            real_replace = os.replace
+            publish_calls = 0
+
+            def fail_publish(source, destination):
+                nonlocal publish_calls
+                source_path = Path(source)
+                destination_path = Path(destination)
+                if source_path == output or destination_path == output:
+                    publish_calls += 1
+                    if publish_calls == 2:
+                        raise RuntimeError("injected runtime publish failure")
+                return real_replace(source, destination)
+
+            with (
+                patch("infersim.cli.os.replace", side_effect=fail_publish),
+                patch(
+                    "infersim.cli.os.rename",
+                    side_effect=PermissionError("injected rollback failure"),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    PermissionError, "injected rollback failure"
+                ) as caught:
+                    run_main(*pair_arguments(output))
+
+            self.assertIsInstance(caught.exception.__cause__, RuntimeError)
+            self.assertFalse(output.exists())
+            entries = tuple(parent.iterdir())
+            self.assertEqual(len(entries), 1)
+            self.assertIn(".results.backup-", entries[0].name)
+            self.assertEqual(tree_snapshot(entries[0]), before)
 
     def test_pair_pd_does_not_swallow_programming_errors(self):
         with tempfile.TemporaryDirectory(prefix="infersim programming error ") as temporary:
             parent = Path(temporary)
             output = parent / "results"
-            output.mkdir()
-            (output / "old.txt").write_bytes(b"old")
+            make_owned_pair_output(output)
             before = tree_snapshot(output)
 
             with patch(

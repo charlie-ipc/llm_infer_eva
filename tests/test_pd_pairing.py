@@ -628,18 +628,105 @@ class PDPairSearchTests(unittest.TestCase):
 
         self.assertIs(result.prefill_context, prefill.context)
         self.assertIs(result.decode_context, decode.context)
+        self.assertIs(result.prefill_result, prefill)
+        self.assertIs(result.decode_result, decode)
         context_free = replace(
-            result, prefill_context=None, decode_context=None
+            result,
+            prefill_context=None,
+            decode_context=None,
+            prefill_result=None,
+            decode_result=None,
         )
         self.assertIsNone(context_free.prefill_context)
         for changes, path in (
             ({"decode_context": None}, "decode_context"),
             ({"prefill_context": "bad"}, "prefill_context"),
+            ({"decode_result": None}, "decode_result"),
+            ({"prefill_result": "bad"}, "prefill_result"),
         ):
             with self.subTest(path=path):
                 with self.assertRaises(InputValidationError) as caught:
                     replace(result, **changes)
                 self.assertEqual(caught.exception.path, path)
+
+    def test_pair_result_rejects_forged_or_mismatched_phase_bindings(self):
+        scenario_set = make_scenario_set()
+        prefill = with_context(
+            make_search_result((make_prefill_candidate(),)), scenario_set
+        )
+        decode = with_context(
+            make_search_result((make_decode_candidate(),)), scenario_set
+        )
+        result = pair_stage_results(
+            prefill,
+            decode,
+            make_pd_link(),
+            scenario_set,
+            {"interactive": 1_000_000},
+        )
+        forged_context = replace(
+            result.prefill_context,
+            hardware=replace(
+                result.prefill_context.hardware, name="FORGED NPU"
+            ),
+        )
+
+        for changes, path in (
+            ({"prefill_context": forged_context}, "prefill_context"),
+            ({"prefill_result": decode}, "prefill_result.stage"),
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(InputValidationError) as caught:
+                    replace(result, **changes)
+                self.assertEqual(caught.exception.path, path)
+
+    def test_pair_result_rejects_candidate_outside_bound_stage_result(self):
+        scenario_set = make_scenario_set()
+        allowed_prefill = with_context(
+            make_search_result(
+                (
+                    make_prefill_candidate(
+                        candidate_id="allowed",
+                        total_cards=1,
+                        request_capacity=100,
+                    ),
+                )
+            ),
+            scenario_set,
+        )
+        other_prefill = with_context(
+            make_search_result(
+                (
+                    make_prefill_candidate(
+                        candidate_id="other",
+                        total_cards=2,
+                        request_capacity=50,
+                    ),
+                )
+            ),
+            scenario_set,
+        )
+        decode = with_context(
+            make_search_result((make_decode_candidate(),)), scenario_set
+        )
+        other_result = pair_stage_results(
+            other_prefill,
+            decode,
+            make_pd_link(),
+            scenario_set,
+            {"interactive": 1_000_000},
+        )
+
+        with self.assertRaises(InputValidationError) as caught:
+            replace(
+                other_result,
+                prefill_result=allowed_prefill,
+                prefill_context=allowed_prefill.context,
+            )
+        self.assertEqual(
+            caught.exception.path,
+            "candidates[0].prefill_candidate",
+        )
 
     def test_phase_context_presence_model_and_precision_must_match(self):
         scenario_set = make_scenario_set()

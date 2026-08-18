@@ -379,6 +379,8 @@ class PDSearchResult:
     pd_link: PDLinkSpec
     prefill_context: SearchContext | None = None
     decode_context: SearchContext | None = None
+    prefill_result: SearchResult | None = None
+    decode_result: SearchResult | None = None
 
     def __post_init__(self) -> None:
         candidates = _candidate_tuple(self.candidates, "candidates")
@@ -446,11 +448,66 @@ class PDSearchResult:
                 raise InputValidationError(
                     path, "must be a SearchContext or None"
                 )
+        if (self.prefill_result is None) != (self.decode_result is None):
+            missing = (
+                "prefill_result"
+                if self.prefill_result is None
+                else "decode_result"
+            )
+            raise InputValidationError(
+                missing, "must be present when the other phase result is bound"
+            )
+        for path, result in (
+            ("prefill_result", self.prefill_result),
+            ("decode_result", self.decode_result),
+        ):
+            if result is not None and not isinstance(result, SearchResult):
+                raise InputValidationError(
+                    path, "must be a SearchResult or None"
+                )
+        if self.prefill_context is not None and self.prefill_result is None:
+            raise InputValidationError(
+                "prefill_result", "must bind results when contexts are present"
+            )
+        if self.prefill_result is not None and self.prefill_context is None:
+            raise InputValidationError(
+                "prefill_context", "must be present when phase results are bound"
+            )
         scenarios = _validate_scenarios(self.scenario_set)
         _validated_link_values(self.pd_link)
         normalized_scenario_set = ScenarioSet(
             self.scenario_set.policy, scenarios
         )
+        allowed_prefill = None
+        allowed_decode = None
+        if self.prefill_result is not None:
+            allowed_prefill = _validate_stage_result(
+                self.prefill_result, "prefill", normalized_scenario_set
+            )
+            allowed_decode = _validate_stage_result(
+                self.decode_result, "decode", normalized_scenario_set
+            )
+            _validate_context_compatibility(
+                self.prefill_result, self.decode_result
+            )
+            if self.prefill_result.context is None:
+                raise InputValidationError(
+                    "prefill_result.context",
+                    "must be present when the result is bound",
+                )
+            if self.decode_result.context is None:
+                raise InputValidationError(
+                    "decode_result.context",
+                    "must be present when the result is bound",
+                )
+            if self.prefill_context != self.prefill_result.context:
+                raise InputValidationError(
+                    "prefill_context", "must equal prefill_result.context"
+                )
+            if self.decode_context != self.decode_result.context:
+                raise InputValidationError(
+                    "decode_context", "must equal decode_result.context"
+                )
         for index, candidate in enumerate(candidates):
             _validate_pd_candidate_context(
                 candidate,
@@ -458,6 +515,24 @@ class PDSearchResult:
                 normalized_scenario_set,
                 self.pd_link,
             )
+            if allowed_prefill is not None and _stage_semantic_key(
+                candidate.prefill_candidate
+            ) not in {
+                _stage_semantic_key(value) for value in allowed_prefill
+            }:
+                raise InputValidationError(
+                    f"candidates[{index}].prefill_candidate",
+                    "must come from the bound prefill result",
+                )
+            if allowed_decode is not None and _stage_semantic_key(
+                candidate.decode_candidate
+            ) not in {
+                _stage_semantic_key(value) for value in allowed_decode
+            }:
+                raise InputValidationError(
+                    f"candidates[{index}].decode_candidate",
+                    "must come from the bound decode result",
+                )
         object.__setattr__(self, "candidates", candidates)
         object.__setattr__(self, "feasible_candidates", feasible)
         object.__setattr__(self, "pareto_frontier", frontier)
@@ -956,4 +1031,10 @@ def pair_stage_results(
         pd_link=pd_link,
         prefill_context=prefill_result.context,
         decode_context=decode_result.context,
+        prefill_result=(
+            prefill_result if prefill_result.context is not None else None
+        ),
+        decode_result=(
+            decode_result if decode_result.context is not None else None
+        ),
     )

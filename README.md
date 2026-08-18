@@ -245,7 +245,14 @@ Reports are written even when no feasible recommendation exists; the command
 then exits 1. Input and schema errors, invalid UTF-8, duplicate JSON keys, and
 output I/O errors are concise stderr diagnostics and exit 2. A `pair-pd` result
 root is published as one generation, so `prefill/`, `decode/`, and `pd/` never
-mix results from different runs.
+mix results from different runs. The root also contains the stable ownership
+marker `.infersim-pd-output.json`. `pair-pd` may create a missing output root or
+claim an existing empty, non-symlink directory. It only overwrites a nonempty
+root when that marker is valid and the root and all three report directories
+contain exactly the documented files. A corrupt marker, symlink, or any extra
+file/directory is rejected without changing the existing tree; choose a new
+output path rather than placing unrelated files in an InferSim-owned result
+root.
 
 This is an analytical planning model, not a measured serving benchmark or a
 P99 latency guarantee. The first version supports decoder-only dense/MoE models
