@@ -83,6 +83,9 @@ def _make_precision(default_gemm_mode, default_activation_bits, **overrides):
         "vector_bits": default_activation_bits,
         "accumulator_bits": 32,
         "kv_cache_bits": 8,
+        "tp_reduce_bits": default_activation_bits,
+        "ep_dispatch_bits": default_activation_bits,
+        "ep_combine_bits": default_activation_bits,
     }
     config.update(overrides)
     return PrecisionSpec.from_dict(config)

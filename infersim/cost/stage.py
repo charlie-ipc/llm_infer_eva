@@ -1,9 +1,9 @@
 from math import ceil, floor, isfinite
 
 from infersim.cost.collective import (
-    activation_payload_bytes,
     all_reduce_cost,
     all_to_all_cost,
+    payload_bytes,
 )
 from infersim.cost.kernels import (
     gemm_cost,
@@ -248,8 +248,11 @@ def _communication_seconds(
     replica_tokens,
     local_attention_tokens,
 ):
-    attention_payload = activation_payload_bytes(
-        local_attention_tokens * model.hidden_size, precision
+    attention_payload = payload_bytes(
+        local_attention_tokens * model.hidden_size,
+        precision.tp_reduce_bits,
+        "tp_reduce_payload_bytes",
+        "tp_reduce_bits",
     )
     attention_tp_seconds = _finite_product(
         all_reduce_cost(
@@ -265,8 +268,11 @@ def _communication_seconds(
             + plan.expert_parallel
             - 1
         ) // plan.expert_parallel
-        routed_payload = activation_payload_bytes(
-            routed_assignments * model.hidden_size, precision
+        routed_payload = payload_bytes(
+            routed_assignments * model.hidden_size,
+            precision.tp_reduce_bits,
+            "tp_reduce_payload_bytes",
+            "tp_reduce_bits",
         )
         routed_tp_seconds = _finite_product(
             all_reduce_cost(
@@ -307,17 +313,43 @@ def _communication_seconds(
 
     ep_seconds = 0.0
     if model.is_moe and plan.expert_parallel > 1:
-        expert_payload = activation_payload_bytes(
+        expert_dispatch_payload = payload_bytes(
             local_attention_tokens
             * model.experts_per_token
             * model.hidden_size,
-            precision,
+            precision.ep_dispatch_bits,
+            "ep_dispatch_payload_bytes",
+            "ep_dispatch_bits",
         )
-        ep_seconds = _finite_product(
-            all_to_all_cost(
-                expert_payload, plan.expert_parallel, hardware
-            ).seconds,
-            2 * model.num_hidden_layers,
+        expert_combine_payload = payload_bytes(
+            local_attention_tokens
+            * model.experts_per_token
+            * model.hidden_size,
+            precision.ep_combine_bits,
+            "ep_combine_payload_bytes",
+            "ep_combine_bits",
+        )
+        ep_seconds = _finite_sum(
+            (
+                _finite_product(
+                    all_to_all_cost(
+                        expert_dispatch_payload,
+                        plan.expert_parallel,
+                        hardware,
+                    ).seconds,
+                    model.num_hidden_layers,
+                    "latency_seconds",
+                ),
+                _finite_product(
+                    all_to_all_cost(
+                        expert_combine_payload,
+                        plan.expert_parallel,
+                        hardware,
+                    ).seconds,
+                    model.num_hidden_layers,
+                    "latency_seconds",
+                ),
+            ),
             "latency_seconds",
         )
     return tp_seconds, ep_seconds

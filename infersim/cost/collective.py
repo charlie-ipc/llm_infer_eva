@@ -52,6 +52,12 @@ def _nonnegative_number(value: object, path: str) -> float:
     return normalized
 
 
+def _bit_width(value: object, path: str) -> int:
+    if type(value) is not int or value not in _BIT_WIDTHS:
+        raise InputValidationError(path, "must be one of 4, 8, 16, or 32")
+    return value
+
+
 def _finite_float(value: int | float, path: str) -> float:
     try:
         normalized = float(value)
@@ -102,22 +108,29 @@ class CollectiveCost:
     seconds: float
 
 
+def payload_bytes(
+    elements: int, bits: int, path: str = "payload_bytes", bits_path: str = "bits"
+) -> float:
+    elements = _nonnegative_integer(elements, "elements")
+    bits = _bit_width(bits, bits_path)
+    return _finite_divide(
+        elements * bits,
+        8,
+        path,
+    )
+
+
 def activation_payload_bytes(
     elements: int, precision: PrecisionSpec
 ) -> float:
     """Return the activation payload size without rounding sub-byte values."""
-    elements = _nonnegative_integer(elements, "elements")
     if not isinstance(precision, PrecisionSpec):
         raise InputValidationError("precision", "must be a PrecisionSpec")
-    activation_bits = precision.activation_bits
-    if type(activation_bits) is not int or activation_bits not in _BIT_WIDTHS:
-        raise InputValidationError(
-            "activation_bits", "must be one of 4, 8, 16, or 32"
-        )
-    return _finite_divide(
-        elements * activation_bits,
-        8,
+    return payload_bytes(
+        elements,
+        precision.activation_bits,
         "activation_payload_bytes",
+        "activation_bits",
     )
 
 
@@ -244,6 +257,25 @@ def all_to_all_cost(
     """
     return _collective_cost(
         "all_to_all",
+        payload_bytes,
+        group_size,
+        hardware,
+        transfer_factor=1,
+        latency_factor=1,
+    )
+
+
+def broadcast_cost(
+    payload_bytes: float, group_size: int, hardware: HardwareSpec
+) -> CollectiveCost:
+    """Estimate ring broadcast for one rank's local payload.
+
+    Ranks are assumed compactly placed: a group that fits within
+    ``cards_per_node`` uses the intra-node link; larger groups use the
+    inter-node link.
+    """
+    return _collective_cost(
+        "broadcast",
         payload_bytes,
         group_size,
         hardware,

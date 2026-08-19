@@ -180,6 +180,33 @@ class PrecisionSpecTests(PathAssertions, unittest.TestCase):
                 self.assertEqual(spec.gemm_mode, mode)
                 self.assertIsNone(spec.validate_hardware(hardware))
 
+    def test_supports_independent_communication_bit_widths(self):
+        base = {
+            "gemm_mode": "w4a8",
+            "weight_bits": 4,
+            "activation_bits": 8,
+            "vector_bits": 8,
+            "accumulator_bits": 32,
+            "kv_cache_bits": 8,
+        }
+
+        spec = PrecisionSpec.from_dict(
+            {
+                **base,
+                "tp_reduce_bits": 32,
+                "ep_dispatch_bits": 4,
+                "ep_combine_bits": 16,
+            }
+        )
+        self.assertEqual(spec.tp_reduce_bits, 32)
+        self.assertEqual(spec.ep_dispatch_bits, 4)
+        self.assertEqual(spec.ep_combine_bits, 16)
+
+        default_spec = PrecisionSpec.from_dict(base)
+        self.assertEqual(default_spec.tp_reduce_bits, 32)
+        self.assertEqual(default_spec.ep_dispatch_bits, 8)
+        self.assertEqual(default_spec.ep_combine_bits, 16)
+
     def test_w4a8_requires_exact_gemm_mode(self):
         config = hardware_config()
         del config["compute_tflops"]["gemm"]["w4a8"]
@@ -221,6 +248,28 @@ class PrecisionSpecTests(PathAssertions, unittest.TestCase):
             ("accumulator_bits", 64),
             ("kv_cache_bits", 0),
             ("gemm_mode", ""),
+        ]
+        for field, value in cases:
+            with self.subTest(field=field):
+                config = dict(base)
+                config[field] = value
+            self.assert_invalid_path(
+                    field, PrecisionSpec.from_dict, config
+                )
+
+    def test_rejects_invalid_communication_bit_widths(self):
+        base = {
+            "gemm_mode": "w4a8",
+            "weight_bits": 4,
+            "activation_bits": 8,
+            "vector_bits": 8,
+            "accumulator_bits": 32,
+            "kv_cache_bits": 8,
+        }
+        cases = [
+            ("tp_reduce_bits", 12),
+            ("ep_dispatch_bits", True),
+            ("ep_combine_bits", "16"),
         ]
         for field, value in cases:
             with self.subTest(field=field):

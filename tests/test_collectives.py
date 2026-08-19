@@ -7,6 +7,8 @@ from infersim.cost.collective import (
     activation_payload_bytes,
     all_reduce_cost,
     all_to_all_cost,
+    broadcast_cost,
+    payload_bytes,
 )
 from infersim.errors import InputValidationError
 from tests.helpers import (
@@ -86,6 +88,8 @@ class CollectiveCostTests(unittest.TestCase):
 
         self.assertEqual(all_reduce_cost(1, 4, hardware).path, "intra_node")
         self.assertEqual(all_reduce_cost(1, 5, hardware).path, "inter_node")
+        self.assertEqual(broadcast_cost(1, 4, hardware).path, "intra_node")
+        self.assertEqual(broadcast_cost(1, 5, hardware).path, "inter_node")
 
     def test_validates_cards_per_node_before_selecting_a_link(self):
         hardware = make_hardware()
@@ -213,6 +217,7 @@ class CollectiveCostTests(unittest.TestCase):
         for function, kind in (
             (all_reduce_cost, "all_reduce"),
             (all_to_all_cost, "all_to_all"),
+            (broadcast_cost, "broadcast"),
         ):
             with self.subTest(kind=kind):
                 cost = function(123, 1, hardware)
@@ -238,7 +243,7 @@ class CollectiveCostTests(unittest.TestCase):
             }
         )
 
-        for function in (all_reduce_cost, all_to_all_cost):
+        for function in (all_reduce_cost, all_to_all_cost, broadcast_cost):
             with self.subTest(function=function.__name__):
                 cost = function(100, 4, hardware)
                 self.assertEqual(cost.launch_seconds, 9e-6)
@@ -259,6 +264,39 @@ class CollectiveCostTests(unittest.TestCase):
         self.assertIsInstance(w4a4, float)
         self.assertEqual(activation_payload_bytes(0, make_w4a8_precision()), 0.0)
 
+    def test_payload_bytes_supports_explicit_bit_widths(self):
+        self.assertEqual(payload_bytes(3, 32), 12.0)
+        self.assertEqual(payload_bytes(3, 16), 6.0)
+        self.assertEqual(payload_bytes(0, 8), 0.0)
+
+    def test_broadcast_uses_ring_fraction_and_selected_link(self):
+        hardware = make_hardware(
+            cards_per_node=4,
+            kernel_launch_latency_us={
+                "gemm": 0,
+                "vector": 0,
+                "collective": 0,
+            },
+            interconnect={
+                "intra_node_gbps": 100,
+                "intra_node_latency_us": 2,
+                "inter_node_gbps": 25,
+                "inter_node_latency_us": 7,
+            },
+        )
+
+        cost = broadcast_cost(800, 8, hardware)
+
+        self.assertEqual(cost.kind, "broadcast")
+        self.assertEqual(cost.path, "inter_node")
+        self.assertEqual(cost.transfer_bytes, 700.0)
+        self.assertEqual(cost.bandwidth_seconds, 700 / 25e9)
+        self.assertEqual(cost.latency_seconds, 7 * 7e-6)
+        self.assertEqual(
+            cost.seconds,
+            cost.bandwidth_seconds + cost.latency_seconds,
+        )
+
     def test_activation_payload_validates_elements_and_local_precision_bits(self):
         precision = make_w4a8_precision()
         for value in (-1, True, 1.5):
@@ -278,7 +316,7 @@ class CollectiveCostTests(unittest.TestCase):
 
     def test_collectives_validate_payload_and_group(self):
         hardware = make_hardware()
-        for function in (all_reduce_cost, all_to_all_cost):
+        for function in (all_reduce_cost, all_to_all_cost, broadcast_cost):
             for value in (-1, True, math.nan, math.inf, -math.inf):
                 with self.subTest(function=function.__name__, payload=value):
                     self.assert_invalid_path(
@@ -298,7 +336,13 @@ class CollectiveCostTests(unittest.TestCase):
             10**1000,
             make_w4a8_precision(),
         )
-        for function in (all_reduce_cost, all_to_all_cost):
+        self.assert_invalid_path(
+            "payload_bytes",
+            payload_bytes,
+            10**1000,
+            8,
+        )
+        for function in (all_reduce_cost, all_to_all_cost, broadcast_cost):
             with self.subTest(function=function.__name__, case="payload"):
                 self.assert_invalid_path(
                     "payload_bytes", function, 10**1000, 2, hardware
@@ -352,12 +396,16 @@ class CollectiveCostTests(unittest.TestCase):
             activation_payload_bytes as exported_activation_payload_bytes,
             all_reduce_cost as exported_all_reduce_cost,
             all_to_all_cost as exported_all_to_all_cost,
+            broadcast_cost as exported_broadcast_cost,
+            payload_bytes as exported_payload_bytes,
         )
 
         self.assertIs(ExportedCollectiveCost, CollectiveCost)
         self.assertIs(exported_activation_payload_bytes, activation_payload_bytes)
         self.assertIs(exported_all_reduce_cost, all_reduce_cost)
         self.assertIs(exported_all_to_all_cost, all_to_all_cost)
+        self.assertIs(exported_broadcast_cost, broadcast_cost)
+        self.assertIs(exported_payload_bytes, payload_bytes)
 
 
 if __name__ == "__main__":

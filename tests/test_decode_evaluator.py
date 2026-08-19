@@ -11,6 +11,7 @@ from infersim.cost import (
     gemm_cost,
     kernel_cost,
     kv_bytes_per_request,
+    payload_bytes,
     recurrent_state_bytes_per_request,
     stage_operations,
     vector_cost,
@@ -445,6 +446,78 @@ class DecodeEvaluatorTests(unittest.TestCase):
         )
 
         self.assertEqual(operations.gemms[0].m, local_requests)
+        self.assertEqual(result.tp_seconds, expected_tp)
+        self.assertEqual(result.ep_seconds, expected_ep)
+
+    def test_decode_moe_communication_uses_independent_tp_and_ep_bit_widths(self):
+        model = make_mla_moe_model(num_hidden_layers=2)
+        hardware = make_hardware()
+        precision = make_w4a8_precision(
+            tp_reduce_bits=32,
+            ep_dispatch_bits=4,
+            ep_combine_bits=16,
+        )
+        plan = make_moe_plan(
+            attention_tp=2,
+            attention_dp=2,
+            moe_tp=2,
+            expert_parallel=2,
+            batch_size=5,
+        )
+        scenario = make_scenario(input_length=100, output_length=20)
+        local_requests = ceil(plan.batch_size / plan.attention_dp)
+        attention_payload = payload_bytes(
+            local_requests * model.hidden_size,
+            precision.tp_reduce_bits,
+        )
+        routed_assignments = ceil(
+            plan.batch_size
+            * model.experts_per_token
+            / plan.expert_parallel
+        )
+        routed_payload = payload_bytes(
+            routed_assignments * model.hidden_size,
+            precision.tp_reduce_bits,
+        )
+        expected_tp = (
+            model.num_full_attention_layers
+            * all_reduce_cost(
+                attention_payload, plan.attention_tp, hardware
+            ).seconds
+            + model.num_hidden_layers
+            * all_reduce_cost(
+                routed_payload, plan.moe_tp, hardware
+            ).seconds
+            + model.num_hidden_layers
+            * all_reduce_cost(
+                attention_payload, plan.moe_tp, hardware
+            ).seconds
+        )
+        expert_dispatch_payload = payload_bytes(
+            local_requests
+            * model.experts_per_token
+            * model.hidden_size,
+            precision.ep_dispatch_bits,
+        )
+        expert_combine_payload = payload_bytes(
+            local_requests
+            * model.experts_per_token
+            * model.hidden_size,
+            precision.ep_combine_bits,
+        )
+        expected_ep = (
+            model.num_hidden_layers
+            * all_to_all_cost(
+                expert_dispatch_payload, plan.expert_parallel, hardware
+            ).seconds
+            + model.num_hidden_layers
+            * all_to_all_cost(
+                expert_combine_payload, plan.expert_parallel, hardware
+            ).seconds
+        )
+
+        result = evaluate_decode(model, hardware, precision, plan, scenario)
+
         self.assertEqual(result.tp_seconds, expected_tp)
         self.assertEqual(result.ep_seconds, expected_ep)
 

@@ -4,5 +4,8 @@
   "activation_bits": 8,
   "vector_bits": 8,
   "accumulator_bits": 32,
-  "kv_cache_bits": 8
+  "kv_cache_bits": 8,
+  "tp_reduce_bits": 32,
+  "ep_dispatch_bits": 8,
+  "ep_combine_bits": 16
 }

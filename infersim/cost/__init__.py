@@ -3,6 +3,8 @@ from infersim.cost.collective import (
     activation_payload_bytes,
     all_reduce_cost,
     all_to_all_cost,
+    broadcast_cost,
+    payload_bytes,
 )
 from infersim.cost.kernels import (
     gemm_cost,
@@ -54,6 +56,7 @@ __all__ = [
     "activation_payload_bytes",
     "all_reduce_cost",
     "all_to_all_cost",
+    "broadcast_cost",
     "evaluate_decode",
     "evaluate_decode_scenarios",
     "evaluate_prefill",
@@ -66,6 +69,7 @@ __all__ = [
     "model_counts",
     "memory_breakdown",
     "pd_payload_bytes",
+    "payload_bytes",
     "recurrent_state_bytes",
     "recurrent_state_bytes_per_request",
     "stage_operations",

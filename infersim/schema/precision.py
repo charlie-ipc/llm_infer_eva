@@ -23,6 +23,14 @@ def _bit_width(data: Mapping[str, Any], field: str) -> int:
     return value
 
 
+def _optional_bit_width(
+    data: Mapping[str, Any], field: str, default: int
+) -> int:
+    if field not in data:
+        return default
+    return _bit_width(data, field)
+
+
 @dataclass(frozen=True)
 class PrecisionSpec:
     gemm_mode: str
@@ -31,6 +39,9 @@ class PrecisionSpec:
     vector_bits: int
     accumulator_bits: int
     kv_cache_bits: int
+    tp_reduce_bits: int = 32
+    ep_dispatch_bits: int = 8
+    ep_combine_bits: int = 16
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "PrecisionSpec":
@@ -39,13 +50,24 @@ class PrecisionSpec:
         gemm_mode = _required(data, "gemm_mode")
         if not isinstance(gemm_mode, str) or not gemm_mode:
             raise InputValidationError("gemm_mode", "must be a non-empty string")
+        activation_bits = _bit_width(data, "activation_bits")
+        vector_bits = _bit_width(data, "vector_bits")
+        accumulator_bits = _bit_width(data, "accumulator_bits")
+        kv_cache_bits = _bit_width(data, "kv_cache_bits")
         return cls(
             gemm_mode=gemm_mode,
             weight_bits=_bit_width(data, "weight_bits"),
-            activation_bits=_bit_width(data, "activation_bits"),
-            vector_bits=_bit_width(data, "vector_bits"),
-            accumulator_bits=_bit_width(data, "accumulator_bits"),
-            kv_cache_bits=_bit_width(data, "kv_cache_bits"),
+            activation_bits=activation_bits,
+            vector_bits=vector_bits,
+            accumulator_bits=accumulator_bits,
+            kv_cache_bits=kv_cache_bits,
+            tp_reduce_bits=_optional_bit_width(
+                data, "tp_reduce_bits", accumulator_bits
+            ),
+            ep_dispatch_bits=_optional_bit_width(
+                data, "ep_dispatch_bits", activation_bits
+            ),
+            ep_combine_bits=_optional_bit_width(data, "ep_combine_bits", 16),
         )
 
     def validate_hardware(self, hardware: HardwareSpec) -> None:
