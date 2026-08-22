@@ -25,7 +25,7 @@
 - Create: `tests/test_640_card_analysis.py`
 - Modify: `docs/superpowers/specs/2026-08-22-640-card-decode-review-package-design.md`
 
-- [ ] **Step 1: Write the failing calculation tests**
+- [x] **Step 1: Write the failing calculation tests**
 
 Create tests that import `examples.analysis.scan_640_card_intra_node` and assert:
 
@@ -58,13 +58,13 @@ class Scan640CardAnalysisTests(unittest.TestCase):
         self.assertNotIn(".csv", output.getvalue())
 ```
 
-- [ ] **Step 2: Run the focused test and verify RED**
+- [x] **Step 2: Run the focused test and verify RED**
 
 Run: `python -m unittest tests.test_640_card_analysis -v`
 
 Expected: import failure because `examples.analysis.scan_640_card_intra_node` does not exist.
 
-- [ ] **Step 3: Correct the approved design specification**
+- [x] **Step 3: Correct the approved design specification**
 
 Remove the erroneous shared-expert TP implication, change the 800 GB/s
 acceptance result from `34.339880` to `35.966099` user token/s and from
@@ -77,7 +77,7 @@ model has no shared expert.
 - Create: `examples/analysis/scan_640_card_intra_node.py`
 - Test: `tests/test_640_card_analysis.py`
 
-- [ ] **Step 1: Define fixed inputs and result type**
+- [x] **Step 1: Define fixed inputs and result type**
 
 Use a frozen `ScanRow` dataclass with fields `intra_node_gbps`, `tp_ms`,
 `ep_ms`, `total_ms`, `user_tokens_per_s`, `system_tokens_per_s`, and `paths`.
@@ -85,14 +85,14 @@ Define the accepted plan constants, current communication widths, fixed GEMM
 and VECTOR milliseconds, and payload constants using production
 `payload_bytes`.
 
-- [ ] **Step 2: Build the hardware schema through the public API**
+- [x] **Step 2: Build the hardware schema through the public API**
 
 Implement `_hardware(intra_node_gbps)` with `HardwareSpec.from_dict`. Supply
 the accepted 200 GB capacity, 2 TB/s DRAM, 1024 TOPS W4A4/W4A8 GEMM, 32 TOPS
 vector modes, eight cards per node, 1 us intra-node latency, 800 GB/s and 5 us
 inter-node link, and 8 us collective launch latency.
 
-- [ ] **Step 3: Calculate only collectives present in the target model**
+- [x] **Step 3: Calculate only collectives present in the target model**
 
 Implement `calculate_row(intra_node_gbps)` as:
 
@@ -108,13 +108,13 @@ ep_ms = LAYERS * (dispatch.seconds + combine.seconds) * 1000
 Do not add a shared-expert all-reduce because the fixed synthetic model has no
 shared expert.
 
-- [ ] **Step 4: Add the printable scan entry point**
+- [x] **Step 4: Add the printable scan entry point**
 
 `scan_rows()` returns exactly 100 through 800 GB/s. `main()` prints per-rank
 work, all four payloads, a CSV-shaped stdout header, and eight formatted rows;
 it does not open any output file.
 
-- [ ] **Step 5: Run focused tests and direct script**
+- [x] **Step 5: Run focused tests and direct script**
 
 Run:
 

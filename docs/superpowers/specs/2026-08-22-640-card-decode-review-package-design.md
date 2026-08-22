@@ -82,6 +82,7 @@ model: synthetic 10T MoE, 50B active parameters, 80 layers
 hidden size: 8192
 routed experts: 1024
 experts per token: 4
+shared experts: 0
 context: 4096 tokens (4095 prior tokens plus one decode token)
 precision: W4A4, KV4, VECTOR FP4
 accelerator: 1024 TOPS GEMM, 32 TOPS VECTOR, 2 TB/s DRAM, 200 GB DRAM
@@ -118,8 +119,9 @@ EP combine payload = 7 * 4 * 8192 * 16 / 8 = 458752 bytes
 ```
 
 All communication group sizes are at most eight, so compact placement selects
-the intra-node path for attention TP, MoE TP, and EP. Inter-node bandwidth is
-therefore not on the active path for this plan.
+the intra-node path for attention TP, routed MoE TP, and EP. The target model
+has no shared expert, so no shared-expert TP collective is added. Inter-node
+bandwidth is therefore not on the active path for this plan.
 
 The ring collective formulas are:
 
@@ -152,7 +154,7 @@ silently overwritten or presented without its precision assumptions.
 Acceptance requires fresh evidence for:
 
 1. the reproduction script exits zero and prints all eight bandwidth rows;
-2. the 800 GB/s row is approximately 34.339880 user token/s and 35164.037
+2. the 800 GB/s row is approximately 35.966099 user token/s and 36829.285
    system token/s;
 3. all collective paths printed by the script are `intra_node`;
 4. the script creates no output file;
@@ -182,7 +184,7 @@ The handoff asks reviewers to confirm or amend:
 - whether ring all-reduce/all-to-all are the right collective approximations;
 - whether FP32 TP reduction, FP4 dispatch, and BF16 combine match kernels;
 - whether collective latency is paid once per modeled launch per layer;
-- whether shared-expert TP communication is required for the target model;
+- whether the target model definition correctly excludes shared experts;
 - whether compute and communication overlap should be introduced; and
 - whether effective bandwidth efficiency or topology contention should reduce
   the nominal intra-node bandwidth before capacity sign-off.
