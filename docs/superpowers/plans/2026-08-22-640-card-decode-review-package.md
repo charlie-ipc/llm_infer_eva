@@ -133,7 +133,7 @@ Expected: tests pass; script prints eight rows and the 800 GB/s row reports
 - Create: `HANDOFF.md`
 - Modify: `README.md`
 
-- [ ] **Step 1: Write the authoritative technical analysis**
+- [x] **Step 1: Write the authoritative technical analysis**
 
 Include sections for scope, fixed inputs, 640-card topology, batch mapping,
 communication precision, payload derivations, ring collective formulas,
@@ -141,7 +141,7 @@ per-layer and 80-layer aggregation, corrected scan output, target margin,
 all-reduce dissemination semantics, historical CSV reconciliation, modeling
 limitations, and expert review questions.
 
-- [ ] **Step 2: Write the handoff**
+- [x] **Step 2: Write the handoff**
 
 State the revision under review, reproduce with:
 
@@ -156,14 +156,14 @@ communication assembly, precision schema, and design specification. Require
 reviewers to return accepted assumptions, requested formula corrections,
 calibration data, and a sign-off verdict.
 
-- [ ] **Step 3: Add a concise README index**
+- [x] **Step 3: Add a concise README index**
 
 Insert a `640-Card Decode Review Package` section before Acknowledgement with
 links to `HANDOFF.md`, the technical analysis, reproduction script, and
 historical CSV. Mention that the current result uses independent TP/EP
 communication widths and that the CSV is preserved as a historical baseline.
 
-- [ ] **Step 4: Check documentation consistency**
+- [x] **Step 4: Check documentation consistency**
 
 Run searches for unfinished placeholders and both old/new headline values.
 The old `36.235890` value must occur only in historical reconciliation; the
@@ -174,7 +174,7 @@ current `35.966099` value must be identified as the 800 GB/s current result.
 **Files:**
 - All files listed above.
 
-- [ ] **Step 1: Run fresh focused and full verification**
+- [x] **Step 1: Run fresh focused and full verification**
 
 ```powershell
 python -m unittest tests.test_640_card_analysis -v
@@ -187,7 +187,7 @@ git diff --check
 Expected: all commands exit zero, the full suite has zero failures, and the
 script prints eight intra-node rows.
 
-- [ ] **Step 2: Review scope and tracked files**
+- [x] **Step 2: Review scope and tracked files**
 
 Run `git status --short`, `git diff --stat`, and `git diff`. Confirm the
 historical CSV is unchanged and no generated output was added.

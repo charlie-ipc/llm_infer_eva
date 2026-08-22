@@ -261,6 +261,16 @@ hybrids. Encoder-decoder models, multimodal roots, and arbitrary custom
 operators are rejected. Production selection should be calibrated against
 kernel and end-to-end measurements on the target stack.
 
+## 640-Card Decode Review Package
+
+The repository includes an expert-review package for a decode-only, 640-card,
+10T-class MoE estimate at batch 1024. Start with [`HANDOFF.md`](HANDOFF.md),
+then read the [full calculation](docs/640-card-decode-performance-analysis.md)
+or run the [deterministic intra-node bandwidth scan](examples/analysis/scan_640_card_intra_node.py).
+The existing [`decode_640_cards.csv`](results/decode_640_cards.csv) is retained
+as a historical baseline; the current analysis uses independent FP32 TP
+reduce, FP4 EP dispatch, and BF16 EP combine widths.
+
 ## Acknowledgement
 
 This work is developed and maintained by Alimama AI Infra Team & Future Living Lab, Alibaba Group.
